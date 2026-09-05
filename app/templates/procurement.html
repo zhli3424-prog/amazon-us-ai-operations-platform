@@ -1,0 +1,33 @@
+<section class="panel">
+  <div class="panel-head"><div><h2>从库存风险生成补货计划</h2><p>建议量按可售、FBA 入库中、本地良品库存、未结采购单和 MOQ 综合计算。</p></div><span class="badge warning">本地采购流程</span></div>
+  <div class="replenishment-grid">
+    {% for p in products if p.inventory.reorder_qty > 0 and p.status == 'active' %}<div class="replenishment-item">
+      {% if p.image_url %}<img class="product-thumb" src="{{ p.image_url }}" alt="{{ p.source_title }}">{% endif %}
+      <div><b>{{ p.source_title }}</b><small>{{ p.sku }} · 可售 {{ p.fulfillable }} · FBA 入库 {{ p.inbound }} · 本地良品 {{ p.warehouse_on_hand }} · 未结采购 {{ p.open_po_units }} · MOQ {{ p.moq }} · 建议 {{ p.inventory.reorder_qty }}</small></div>
+      <form class="api-form" action="/api/products/{{ p.id }}/replenishment-plans"><input type="hidden" name="safety_days" value="14"><input type="number" min="0" step="{{ p.moq }}" name="quantity" value="{{ p.inventory.reorder_qty }}"><input name="reason" value="库存覆盖不足，已扣除在途和未结采购量" required><button>创建计划</button></form>
+    </div>{% else %}<p class="empty">当前没有需要补货的在售商品。</p>{% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><div><h2>补货计划</h2><p>计划必须审批后才能转成采购单。</p></div></div>
+  <div class="workflow-list">{% for plan in replenishment_plans %}<div class="workflow-row">
+    {% if plan.image_url %}<img class="product-thumb" src="{{ plan.image_url }}" alt="{{ plan.source_title }}">{% endif %}
+    <div><b>#{{ plan.id }} · {{ plan.source_title }}</b><small>{{ plan.sku }} · 建议 {{ plan.suggested_qty }} · 审批数量 {{ plan.approved_qty or '待定' }} · {{ plan.reason }}</small><small>创建人 {{ plan.created_by }} · 版本 {{ plan.version }}</small></div>
+    <span class="badge {{ 'healthy' if plan.status in ['approved','converted'] else 'critical' if plan.status == 'rejected' else 'warning' }}">{{ plan.status }}</span>
+    <div>{% if plan.status == 'draft' %}<form class="api-form inline" action="/api/replenishment-plans/{{ plan.id }}/approve"><input type="hidden" name="version" value="{{ plan.version }}"><input type="number" min="1" name="approved_qty" value="{{ plan.approved_qty or plan.suggested_qty }}" required><button>批准</button></form><button class="danger" type="button" data-action="/api/replenishment-plans/{{ plan.id }}/reject" data-version="{{ plan.version }}" data-require-reason="true">拒绝</button>{% elif plan.status == 'approved' %}<button type="button" data-action="/api/replenishment-plans/{{ plan.id }}/convert">转采购单</button>{% endif %}</div>
+  </div>{% else %}<p class="empty">暂无补货计划。</p>{% endfor %}</div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><div><h2>采购单与质检收货</h2><p>合格品进入本地仓良品库存，拒收品进入质检隔离；均不会直接增加 FBA 可售库存。</p></div></div>
+  <div class="workflow-list">{% for po in purchase_orders %}<div class="purchase-order">
+    <div class="panel-head"><div><span class="badge {{ 'healthy' if po.status == 'received' else 'warning' }}">{{ po.status }}</span><b>{{ po.po_number }} · {{ po.supplier_name }}</b><small>{{ po.payment_terms }} · 预计到货 {{ po.expected_at_display }}</small></div><div><b>${{ '%.2f'|format(po.total_amount) }}</b><small>版本 {{ po.version }}</small></div></div>
+    {% for item in po['items'] %}<div class="workflow-row">
+      {% if item.image_url %}<img class="product-thumb" src="{{ item.image_url }}" alt="{{ item.source_title }}">{% endif %}
+      <div><b>{{ item.source_title }}</b><small>{{ item.sku }} · 合格 {{ item.received_qty }} · 拒收 {{ item.rejected_qty }} / 采购 {{ item.ordered_qty }} · 单价 ${{ '%.2f'|format(item.unit_cost) }}</small></div>
+      {% if po.status in ['approved','sent_demo','partially_received'] and item.received_qty + item.rejected_qty < item.ordered_qty %}<form class="api-form inline" action="/api/purchase-order-items/{{ item.id }}/receive"><label>合格<input type="number" min="0" name="quantity" value="{{ item.ordered_qty - item.received_qty - item.rejected_qty }}"></label><label>拒收<input type="number" min="0" name="rejected_quantity" value="0"></label><input name="note" value="到货数量、外箱和抽检结果已人工核验" required><button>登记质检收货</button></form>{% endif %}
+    </div>{% endfor %}
+    <div class="actions">{% if po.status == 'draft' %}<button type="button" data-action="/api/purchase-orders/{{ po.id }}/approve" data-version="{{ po.version }}">批准采购单</button>{% elif po.status == 'approved' %}<button type="button" data-action="/api/purchase-orders/{{ po.id }}/send-demo" data-version="{{ po.version }}">模拟发送供应商</button>{% endif %}</div>
+  </div>{% else %}<p class="empty">暂无采购单。</p>{% endfor %}</div>
+</section>

@@ -1,0 +1,6 @@
+<section class="panel">
+  <div class="panel-head"><div><h2>运营通知</h2><p>由 SLA、同步失败、库存风险和反馈整改规则自动生成。</p></div><span>{{ notifications|selectattr('status','equalto','unread')|list|length }} 条未读</span></div>
+  <div class="task-list">
+    {% for notification in notifications %}<div class="task {{ 'red' if notification.severity == 'critical' else 'amber' }}"><a href="{{ notification.href }}"><b>{{ notification.category }} · {{ notification.title }}</b><small>{{ notification.last_seen_at }}</small></a>{% if notification.status == 'unread' %}<button type="button" data-action="/api/notifications/{{ notification.id }}/read">标记已读</button>{% else %}<span class="badge healthy">已读</span>{% endif %}</div>{% else %}<p class="empty">当前没有运营通知。</p>{% endfor %}
+  </div>
+</section>

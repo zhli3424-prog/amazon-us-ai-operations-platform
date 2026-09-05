@@ -1,0 +1,24 @@
+<section class="panel">
+  <div class="panel-head"><div><h2>反馈改进闭环</h2><p>把聚合主题转成有负责人、有截止时间、有结果的改进行动。</p></div></div>
+  {% for f in feedback %}
+    <details class="ticket-operation">
+      <summary><b>{{ f.sku }} · {{ f.negative_topic }}</b><span>{{ f.actions|length }} 项行动</span></summary>
+      <form class="api-form ticket-tools" action="/api/feedback/{{ f.external_event_id }}/actions">
+        <select name="action_type"><option value="product_quality">产品质量</option><option value="listing_update">文案更新</option><option value="supplier_corrective_action">供应商整改</option><option value="packaging_change">包装改进</option></select>
+        <input name="owner" placeholder="负责人" required>
+        <input type="datetime-local" name="due_at" required>
+        <button>创建行动</button>
+      </form>
+      {% for action in f.actions %}
+        <form class="api-form ticket-workflow" action="/api/feedback-actions/{{ action.id }}/update">
+          <input type="hidden" name="version" value="{{ action.version }}">
+          <label>类型<input value="{{ action.action_type }}" disabled></label>
+          <label>负责人<input value="{{ action.owner }}" disabled></label>
+          <label>状态<select name="status"><option value="open" {{ 'selected' if action.status == 'open' else '' }}>待开始</option><option value="in_progress" {{ 'selected' if action.status == 'in_progress' else '' }}>处理中</option><option value="resolved" {{ 'selected' if action.status == 'resolved' else '' }}>已完成</option></select></label>
+          <label>处理结果<input name="outcome" value="{{ action.outcome or '' }}" placeholder="完成时必填"></label>
+          <button class="secondary">更新</button>
+        </form>
+      {% else %}<p class="muted">尚未创建改进行动。</p>{% endfor %}
+    </details>
+  {% endfor %}
+</section>

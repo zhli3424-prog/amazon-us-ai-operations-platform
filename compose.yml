@@ -1,0 +1,53 @@
+x-app: &app
+  build: .
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    APP_ENV: production
+    DATABASE_PATH: /app/data/app.db
+    BACKUP_ROOT: /app/data/backups
+    SYNC_INLINE: "false"
+  volumes:
+    - ecommerce_ai_data:/app/data
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "8030:8030"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8030/health/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_ENV: production
+      DATABASE_PATH: /app/data/app.db
+      BACKUP_ROOT: /app/data/backups
+      SYNC_INLINE: "false"
+      WORKER_ID: amazon-us-sync-worker
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.main import worker_health; raise SystemExit(0 if worker_health()['healthy'] else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+  backup:
+    <<: *app
+    profiles: ["maintenance"]
+    restart: "no"
+    command: ["python", "scripts/backup_db.py", "--source", "/app/data/app.db", "--target-dir", "/app/data/backups", "--retention", "14"]
+    environment:
+      APP_ENV: production
+      DATABASE_PATH: /app/data/app.db
+      BACKUP_ROOT: /app/data/backups
+
+volumes:
+  ecommerce_ai_data:
+    name: cross-border-ai-data

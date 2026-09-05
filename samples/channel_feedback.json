@@ -1,0 +1,12 @@
+[
+  {"external_event_id":"CF-US-B0D7K2M4Q1-2026-08","sku":"KT-SCALE-5K-US","asin":"B0D7K2M4Q1","positive_topic":"称重响应快、读数清晰","negative_topic":"触控键偶有误触","mention_count":86,"rating_impact":0.12,"trend_label":"正面提及上升","period":"2026-08"},
+  {"external_event_id":"CF-US-B0C9R6T2L8-2026-08","sku":"KT-FROTH-01-US","asin":"B0C9R6T2L8","positive_topic":"泡沫细腻、充电方便","negative_topic":"高速档声音偏大","mention_count":133,"rating_impact":0.08,"trend_label":"整体稳定","period":"2026-08"},
+  {"external_event_id":"CF-US-B0D8H4P7X3-2026-08","sku":"HM-VAC-02-US","asin":"B0D8H4P7X3","positive_topic":"轻便、缝隙吸头实用","negative_topic":"续航和开机故障提及增加","mention_count":71,"rating_impact":-0.24,"trend_label":"负面提及上升","period":"2026-08"},
+  {"external_event_id":"CF-US-B0C6W9J3F5-2026-08","sku":"HM-LIGHT-6-US","asin":"B0C6W9J3F5","positive_topic":"安装方便、感应灵敏","negative_topic":"胶贴在粗糙表面易脱落","mention_count":158,"rating_impact":0.06,"trend_label":"整体稳定","period":"2026-08"},
+  {"external_event_id":"CF-US-B0C8M5U2K7-2026-08","sku":"PET-ROLL-01-US","asin":"B0C8M5U2K7","positive_topic":"去毛效率高、可重复使用","negative_topic":"集毛仓卡扣偏紧","mention_count":204,"rating_impact":0.18,"trend_label":"正面提及上升","period":"2026-08"},
+  {"external_event_id":"CF-US-B0D6B3R9T4-2026-08","sku":"PET-FILT-12-US","asin":"B0D6B3R9T4","positive_topic":"更换简单、数量充足","negative_topic":"兼容型号说明不够醒目","mention_count":64,"rating_impact":-0.07,"trend_label":"负面提及轻微上升","period":"2026-08"},
+  {"external_event_id":"CF-US-B0C7P4N8D2-2026-08","sku":"TR-CUBE-6-US","asin":"B0C7P4N8D2","positive_topic":"分类清晰、拉链顺滑","negative_topic":"满载后网面支撑一般","mention_count":119,"rating_impact":0.1,"trend_label":"正面提及上升","period":"2026-08"},
+  {"external_event_id":"CF-US-B0D5N1R8W3-2026-08","sku":"FT-BALL-SET-US","asin":"B0D5N1R8W3","positive_topic":"硬度组合适合放松","negative_topic":"个别订单缺少收纳袋","mention_count":49,"rating_impact":-0.19,"trend_label":"负面提及上升","period":"2026-08"},
+  {"external_event_id":"CF-US-B0C4X7B2P9-2026-08","sku":"OF-STAND-AL-US","asin":"B0C4X7B2P9","positive_topic":"结构稳固、角度调节顺畅","negative_topic":"大尺寸电脑边缘略晃","mention_count":92,"rating_impact":0.09,"trend_label":"整体稳定","period":"2026-08"},
+  {"external_event_id":"CF-US-B0C9V3D7N2-2026-08","sku":"OD-LANT-2-US","asin":"B0C9V3D7N2","positive_topic":"亮度充足、便携","negative_topic":"单灯无法充电提及增加","mention_count":67,"rating_impact":-0.22,"trend_label":"负面提及上升","period":"2026-08"}
+]

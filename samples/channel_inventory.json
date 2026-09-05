@@ -1,0 +1,22 @@
+[
+  {"external_event_id":"FBA-US-KT-SCALE-5K-US","sku":"KT-SCALE-5K-US","fulfillable":312,"reserved":46,"inbound":180,"unfulfillable":7,"daily_sales":29.8,"lead_time_days":14},
+  {"external_event_id":"FBA-US-KT-FROTH-01-US","sku":"KT-FROTH-01-US","fulfillable":846,"reserved":129,"inbound":260,"unfulfillable":25,"daily_sales":44.2,"lead_time_days":12},
+  {"external_event_id":"FBA-US-KT-SEAL-12-US","sku":"KT-SEAL-12-US","fulfillable":45,"reserved":8,"inbound":120,"unfulfillable":2,"daily_sales":13.6,"lead_time_days":24},
+  {"external_event_id":"FBA-US-HM-VAC-02-US","sku":"HM-VAC-02-US","fulfillable":38,"reserved":11,"inbound":96,"unfulfillable":4,"daily_sales":21.9,"lead_time_days":28},
+  {"external_event_id":"FBA-US-HM-LIGHT-6-US","sku":"HM-LIGHT-6-US","fulfillable":765,"reserved":118,"inbound":220,"unfulfillable":22,"daily_sales":36.5,"lead_time_days":18},
+  {"external_event_id":"FBA-US-HM-BAG-10-US","sku":"HM-BAG-10-US","fulfillable":412,"reserved":74,"inbound":120,"unfulfillable":14,"daily_sales":25.7,"lead_time_days":20},
+  {"external_event_id":"FBA-US-PET-ROLL-01-US","sku":"PET-ROLL-01-US","fulfillable":1098,"reserved":196,"inbound":220,"unfulfillable":36,"daily_sales":55.4,"lead_time_days":16},
+  {"external_event_id":"FBA-US-PET-FILT-12-US","sku":"PET-FILT-12-US","fulfillable":88,"reserved":16,"inbound":144,"unfulfillable":3,"daily_sales":18.1,"lead_time_days":22},
+  {"external_event_id":"FBA-US-PET-BOWL-S-US","sku":"PET-BOWL-S-US","fulfillable":301,"reserved":49,"inbound":90,"unfulfillable":15,"daily_sales":14.9,"lead_time_days":18},
+  {"external_event_id":"FBA-US-TR-CUBE-6-US","sku":"TR-CUBE-6-US","fulfillable":571,"reserved":93,"inbound":180,"unfulfillable":36,"daily_sales":31.7,"lead_time_days":26},
+  {"external_event_id":"FBA-US-TR-WASH-L-US","sku":"TR-WASH-L-US","fulfillable":55,"reserved":9,"inbound":80,"unfulfillable":1,"daily_sales":10.8,"lead_time_days":24},
+  {"external_event_id":"FBA-US-TR-LUG-50-US","sku":"TR-LUG-50-US","fulfillable":620,"reserved":104,"inbound":160,"unfulfillable":36,"daily_sales":42.5,"lead_time_days":15},
+  {"external_event_id":"FBA-US-FT-BAND-5-US","sku":"FT-BAND-5-US","fulfillable":465,"reserved":81,"inbound":140,"unfulfillable":24,"daily_sales":24.6,"lead_time_days":20},
+  {"external_event_id":"FBA-US-FT-STRAP-2-US","sku":"FT-STRAP-2-US","fulfillable":130,"reserved":21,"inbound":35,"unfulfillable":4,"daily_sales":8.7,"lead_time_days":16},
+  {"external_event_id":"FBA-US-FT-BALL-SET-US","sku":"FT-BALL-SET-US","fulfillable":22,"reserved":7,"inbound":84,"unfulfillable":2,"daily_sales":16.8,"lead_time_days":19},
+  {"external_event_id":"FBA-US-OF-STAND-AL-US","sku":"OF-STAND-AL-US","fulfillable":448,"reserved":68,"inbound":150,"unfulfillable":14,"daily_sales":20.4,"lead_time_days":25},
+  {"external_event_id":"FBA-US-OF-CABLE-16-US","sku":"OF-CABLE-16-US","fulfillable":178,"reserved":31,"inbound":48,"unfulfillable":3,"daily_sales":27.3,"lead_time_days":14},
+  {"external_event_id":"FBA-US-OF-MAT-XL-US","sku":"OF-MAT-XL-US","fulfillable":254,"reserved":42,"inbound":82,"unfulfillable":12,"daily_sales":11.6,"lead_time_days":23},
+  {"external_event_id":"FBA-US-OD-LANT-2-US","sku":"OD-LANT-2-US","fulfillable":30,"reserved":10,"inbound":120,"unfulfillable":3,"daily_sales":18.9,"lead_time_days":30},
+  {"external_event_id":"FBA-US-OD-DRY-20-US","sku":"OD-DRY-20-US","fulfillable":286,"reserved":37,"inbound":88,"unfulfillable":9,"daily_sales":9.4,"lead_time_days":27}
+]

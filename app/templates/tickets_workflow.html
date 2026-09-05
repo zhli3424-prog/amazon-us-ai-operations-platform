@@ -1,0 +1,44 @@
+<section class="panel">
+  <div class="panel-head"><div><h2>售后执行与完整记录</h2><p>备注、升级、重新打开以及退款/补发/取消申请均保留审计轨迹。</p></div><span class="badge warning">所有外部动作均需人工批准</span></div>
+  {% for t in tickets %}
+    <details class="ticket-operation">
+      <summary><b>{{ t.order_id_masked }} · {{ t.title }}</b><span>{{ t.escalation_level }} · 已重开 {{ t.reopen_count }} 次 · {{ t.events|length }} 条记录</span></summary>
+      {% if t.reply_message %}
+        <div class="message-workflow">
+          <h3>买家回复审批流 <span class="badge warning">{{ message_status_labels.get(t.reply_message.status,t.reply_message.status) }}</span></h3>
+          {% if t.reply_message.last_error %}<p class="overdue">{{ t.reply_message.last_error }}</p>{% endif %}
+          <form class="api-form" action="/api/tickets/{{ t.id }}/messages/{{ t.reply_message.id }}/save">
+            <input type="hidden" name="message_version" value="{{ t.reply_message.version }}">
+            <label>英文买家回复<textarea name="body" rows="5" required>{{ t.reply_message.body }}</textarea></label>
+            <label>中文内部行动方案<textarea name="action_plan" rows="3" required>{{ t.reply_message.action_plan }}</textarea></label>
+            {% if t.reply_message.status in ['draft','approved','failed'] %}<button>保存修改</button>{% endif %}
+          </form>
+          {% if t.reply_message.status == 'draft' %}
+            <form class="api-form inline" action="/api/tickets/{{ t.id }}/messages/{{ t.reply_message.id }}/approve"><input type="hidden" name="message_version" value="{{ t.reply_message.version }}"><button class="success">人工批准</button></form>
+          {% elif t.reply_message.status in ['approved','failed'] %}
+            <form class="api-form inline" action="/api/tickets/{{ t.id }}/messages/{{ t.reply_message.id }}/send-demo"><input type="hidden" name="message_version" value="{{ t.reply_message.version }}"><button class="success">{{ '重试模拟发送' if t.reply_message.status == 'failed' else '模拟发送' }}</button></form>
+          {% endif %}
+          <p class="muted">仅演示发送状态机，不会调用真实 Amazon Messaging API。</p>
+        </div>
+      {% endif %}
+      <div class="ticket-tools">
+        <form class="api-form" action="/api/tickets/{{ t.id }}/attachments" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.txt" required><button class="secondary">上传私有附件</button>
+        </form>
+        <form class="api-form" action="/api/tickets/{{ t.id }}/notes">
+          <input type="hidden" name="version" value="{{ t.version }}"><input name="body" placeholder="添加内部处理备注" required><button class="secondary">添加备注</button>
+        </form>
+        <form class="api-form" action="/api/tickets/{{ t.id }}/escalate">
+          <input type="hidden" name="version" value="{{ t.version }}"><select name="escalation_level"><option value="team_lead">客服主管</option><option value="operations_manager">运营经理</option><option value="compliance">合规负责人</option><option value="none">取消升级</option></select><input name="reason" placeholder="升级原因" required><button class="secondary">更新升级</button>
+        </form>
+        {% if t.order %}<form class="api-form" action="/api/tickets/{{ t.id }}/service-actions">
+          <select name="action_type"><option value="refund">退款申请</option><option value="reship">重新发货</option><option value="replacement">补发替换品</option><option value="cancel">取消订单</option></select><input type="number" min="0" step="0.01" name="amount" value="0" placeholder="金额"><input name="reason" placeholder="申请原因" required><button>提交审批</button>
+        </form>{% endif %}
+        {% if t.status in ['resolved','closed'] %}<button class="secondary" type="button" data-action="/api/tickets/{{ t.id }}/reopen" data-version="{{ t.version }}" data-require-reason="true">重新打开工单</button>{% endif %}
+      </div>
+      {% if t.private_attachments %}<div class="service-actions"><h3>私有附件</h3>{% for attachment in t.private_attachments %}<div><a href="/api/tickets/{{ t.id }}/attachments/{{ attachment.id }}">{{ attachment.original_name }}</a><small>{{ (attachment.size_bytes / 1024)|round(1) }} KB · {{ attachment.uploaded_by }} · {{ attachment.created_at }}</small></div>{% endfor %}</div>{% endif %}
+      {% if t.service_actions %}<div class="service-actions"><h3>售后动作</h3>{% for action in t.service_actions %}<div><b>{{ action.action_type }} · ${{ '%.2f'|format(action.amount) }}</b><span class="badge {{ 'healthy' if action.status == 'completed' else 'warning' }}">{{ action.status }}</span><small>{{ action.reason }} · 申请人 {{ action.requested_by }}</small>{% if action.status == 'requested' %}<button type="button" data-action="/api/service-actions/{{ action.id }}/approve">批准</button>{% elif action.status == 'approved' %}<button type="button" data-action="/api/service-actions/{{ action.id }}/complete">登记完成</button>{% endif %}</div>{% endfor %}<p class="muted">“登记完成”只表示内部流程完结，当前不会调用真实亚马逊退款、取消或补发接口。</p></div>{% endif %}
+      <div class="timeline"><h3>处理时间线</h3>{% for event in t.events %}<p><b>{{ event.event_type }}</b> · {{ event.body }}<small>{{ event.actor }} · {{ event.created_at }}</small></p>{% else %}<p class="muted">暂无历史记录。</p>{% endfor %}</div>
+    </details>
+  {% endfor %}
+</section>

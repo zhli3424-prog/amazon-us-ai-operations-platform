@@ -1,0 +1,20 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m py_compile app/main.py app/security.py app/worker.py scripts/*.py
+      - run: python -m pytest tests -q -p no:cacheprovider
+      - run: APP_ENV=testing DATABASE_PATH=/tmp/cross-border-ci.db ADMIN_PASSWORD='CiAdminPassword123' SESSION_SECRET='ci-session-secret-at-least-32-characters' python -m app.main init-db
+      - run: python scripts/check_migrations.py --database /tmp/cross-border-ci.db
+      - run: python scripts/backup_db.py --source /tmp/cross-border-ci.db --target-dir /tmp/cross-border-backups --retention 2
+      - run: docker build -t cross-border-ai:test .

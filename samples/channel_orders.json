@@ -1,0 +1,52 @@
+[
+  {
+    "external_order_id": "DEMO-AMZ-20260901-4821", "order_id_masked": "114-***-4821", "status": "delivered", "fulfillment_channel": "AFN",
+    "purchase_at": "2026-08-27T09:18:00Z", "latest_ship_at": "2026-08-28T23:59:00Z", "latest_delivery_at": "2026-09-01T23:59:00Z",
+    "currency": "USD", "item_total": 42.99, "shipping_total": 0, "tax_total": 3.55, "promotion_total": 0, "refund_total": 0, "buyer_alias": "客户 A***7",
+    "items": [{"external_item_id": "ITEM-4821-01", "sku": "HM-VAC-02-US", "asin": "B0D8H4P7X3", "quantity": 1, "item_price": 42.99, "item_tax": 3.55, "promotion_discount": 0, "item_status": "delivered"}], "returns": []
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260901-9306", "order_id_masked": "112-***-9306", "status": "refunded", "fulfillment_channel": "AFN",
+    "purchase_at": "2026-08-24T18:42:00Z", "latest_ship_at": "2026-08-25T23:59:00Z", "latest_delivery_at": "2026-08-30T23:59:00Z",
+    "currency": "USD", "item_total": 55.98, "shipping_total": 0, "tax_total": 4.62, "promotion_total": 0, "refund_total": 27.99, "buyer_alias": "客户 M***2",
+    "items": [{"external_item_id": "ITEM-9306-01", "sku": "OD-LANT-2-US", "asin": "B0C9V3D7N2", "quantity": 2, "item_price": 55.98, "item_tax": 4.62, "promotion_discount": 0, "item_status": "refunded"}],
+    "returns": [{"external_return_id": "RET-9306-01", "external_item_id": "ITEM-9306-01", "sku": "OD-LANT-2-US", "reason_code": "DEFECTIVE", "reason_text": "其中一只露营灯无法充电", "quantity": 1, "refund_amount": 27.99, "status": "refunded", "carrier": "UPS", "tracking_masked": "1Z***7742", "requested_at": "2026-09-01T16:42:00Z", "received_at": "2026-09-04T19:20:00Z", "refunded_at": "2026-09-05T03:10:00Z"}]
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260902-1764", "order_id_masked": "113-***-1764", "status": "delivered", "fulfillment_channel": "AFN",
+    "purchase_at": "2026-08-29T01:40:00Z", "latest_ship_at": "2026-08-30T23:59:00Z", "latest_delivery_at": "2026-09-02T23:59:00Z",
+    "currency": "USD", "item_total": 22.99, "shipping_total": 0, "tax_total": 1.90, "promotion_total": 2.00, "refund_total": 0, "buyer_alias": "客户 J***9",
+    "items": [{"external_item_id": "ITEM-1764-01", "sku": "KT-SCALE-5K-US", "asin": "B0D7K2M4Q1", "quantity": 1, "item_price": 22.99, "item_tax": 1.90, "promotion_discount": 2.00, "item_status": "delivered"}], "returns": []
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260902-6548", "order_id_masked": "111-***-6548", "status": "cancelled", "fulfillment_channel": "MFN",
+    "purchase_at": "2026-09-02T03:12:00Z", "latest_ship_at": "2026-09-03T23:59:00Z", "latest_delivery_at": "2026-09-09T23:59:00Z",
+    "currency": "USD", "item_total": 31.99, "shipping_total": 0, "tax_total": 2.64, "promotion_total": 0, "refund_total": 0, "buyer_alias": "客户 S***4",
+    "items": [{"external_item_id": "ITEM-6548-01", "sku": "TR-CUBE-6-US", "asin": "B0C7P4N8D2", "quantity": 1, "item_price": 31.99, "item_tax": 2.64, "promotion_discount": 0, "item_status": "cancelled"}], "returns": []
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260902-7032", "order_id_masked": "114-***-7032", "status": "partially_refunded", "fulfillment_channel": "AFN",
+    "purchase_at": "2026-08-25T12:08:00Z", "latest_ship_at": "2026-08-26T23:59:00Z", "latest_delivery_at": "2026-08-31T23:59:00Z",
+    "currency": "USD", "item_total": 46.99, "shipping_total": 0, "tax_total": 3.88, "promotion_total": 0, "refund_total": 8.00, "buyer_alias": "客户 D***1",
+    "items": [{"external_item_id": "ITEM-7032-01", "sku": "FT-BALL-SET-US", "asin": "B0D5N1R8W3", "quantity": 1, "item_price": 46.99, "item_tax": 3.88, "promotion_discount": 0, "item_status": "delivered"}],
+    "returns": [{"external_return_id": "RET-7032-01", "external_item_id": "ITEM-7032-01", "sku": "FT-BALL-SET-US", "reason_code": "MISSING_PARTS", "reason_text": "包装内缺少收纳袋", "quantity": 1, "refund_amount": 8.00, "status": "authorized", "carrier": null, "tracking_masked": null, "requested_at": "2026-09-02T11:06:00Z", "received_at": null, "refunded_at": null}]
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260902-2189", "order_id_masked": "112-***-2189", "status": "shipped", "fulfillment_channel": "AFN",
+    "purchase_at": "2026-09-01T08:36:00Z", "latest_ship_at": "2026-09-02T23:59:00Z", "latest_delivery_at": "2026-09-06T23:59:00Z",
+    "currency": "USD", "item_total": 19.99, "shipping_total": 0, "tax_total": 1.65, "promotion_total": 0, "refund_total": 0, "buyer_alias": "客户 R***6",
+    "items": [{"external_item_id": "ITEM-2189-01", "sku": "PET-FILT-12-US", "asin": "B0D6B3R9T4", "quantity": 1, "item_price": 19.99, "item_tax": 1.65, "promotion_discount": 0, "item_status": "shipped"}], "returns": []
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260903-8455", "order_id_masked": "113-***-8455", "status": "pending", "fulfillment_channel": "MFN",
+    "purchase_at": "2026-09-03T00:18:00Z", "latest_ship_at": "2026-09-04T23:59:00Z", "latest_delivery_at": "2026-09-10T23:59:00Z",
+    "currency": "USD", "item_total": 28.99, "shipping_total": 0, "tax_total": 2.39, "promotion_total": 0, "refund_total": 0, "buyer_alias": "客户 K***3",
+    "items": [{"external_item_id": "ITEM-8455-01", "sku": "OF-MAT-XL-US", "asin": "B0D8Q1S4Y6", "quantity": 1, "item_price": 28.99, "item_tax": 2.39, "promotion_discount": 0, "item_status": "pending"}], "returns": []
+  },
+  {
+    "external_order_id": "DEMO-AMZ-20260903-3908", "order_id_masked": "111-***-3908", "status": "delivered", "fulfillment_channel": "AFN",
+    "purchase_at": "2026-08-28T14:22:00Z", "latest_ship_at": "2026-08-29T23:59:00Z", "latest_delivery_at": "2026-09-02T23:59:00Z",
+    "currency": "USD", "item_total": 36.99, "shipping_total": 0, "tax_total": 3.05, "promotion_total": 3.00, "refund_total": 0, "buyer_alias": "客户 L***5",
+    "items": [{"external_item_id": "ITEM-3908-01", "sku": "HM-BAG-10-US", "asin": "B0D2Q7A6E9", "quantity": 1, "item_price": 36.99, "item_tax": 3.05, "promotion_discount": 3.00, "item_status": "delivered"}], "returns": []
+  }
+]
