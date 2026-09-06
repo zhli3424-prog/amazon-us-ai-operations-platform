@@ -3,33 +3,65 @@ x-app: &app
   env_file:
     - path: .env
       required: false
-  environment:
+  environment: &app-environment
     APP_ENV: production
+    SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+    MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?MFA_ENCRYPTION_KEY is required}
+    AUDIT_SIGNING_KEY: ${AUDIT_SIGNING_KEY:?AUDIT_SIGNING_KEY is required}
+    AUDIT_CHECKPOINT_PATH: /app/audit-checkpoints/checkpoints.jsonl
+    PRIVACY_HASH_KEY: ${PRIVACY_HASH_KEY:?PRIVACY_HASH_KEY is required}
+    HEALTH_TOKEN: ${HEALTH_TOKEN:?HEALTH_TOKEN is required}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+    ALLOW_DEMO_AI: ${ALLOW_DEMO_AI:-false}
+    ATTACHMENT_SCANNER_URL: ${ATTACHMENT_SCANNER_URL:?ATTACHMENT_SCANNER_URL is required}
+    ATTACHMENT_ENCRYPTION_KEY: ${ATTACHMENT_ENCRYPTION_KEY:?ATTACHMENT_ENCRYPTION_KEY is required}
     DATABASE_PATH: /app/data/app.db
-    BACKUP_ROOT: /app/data/backups
+    BACKUP_ROOT: /app/backups
+    BACKUP_REPLICA_PATH: /app/backup-replica
+    MIGRATE_ON_STARTUP: "false"
     SYNC_INLINE: "false"
   volumes:
     - ecommerce_ai_data:/app/data
+    - ecommerce_ai_backups:/app/backups
+    - type: bind
+      source: ${BACKUP_REPLICA_HOST_PATH:?BACKUP_REPLICA_HOST_PATH is required}
+      target: /app/backup-replica
+    - type: bind
+      source: ${AUDIT_CHECKPOINT_HOST_PATH:?AUDIT_CHECKPOINT_HOST_PATH is required}
+      target: /app/audit-checkpoints
   restart: unless-stopped
 
 services:
+  migrate:
+    <<: *app
+    command: ["python", "-m", "app.main", "init-db"]
+    restart: "no"
+    healthcheck:
+      disable: true
   web:
     <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8030:8030"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8030/health/ready', timeout=3)"]
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8030/health/ready',headers={'X-Health-Token':os.environ['HEALTH_TOKEN']}); urllib.request.urlopen(r,timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
   worker:
     <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     command: ["python", "-m", "app.worker"]
     environment:
+      <<: *app-environment
       APP_ENV: production
       DATABASE_PATH: /app/data/app.db
-      BACKUP_ROOT: /app/data/backups
+      BACKUP_ROOT: /app/backups
       SYNC_INLINE: "false"
       WORKER_ID: amazon-us-sync-worker
     healthcheck:
@@ -42,12 +74,21 @@ services:
     <<: *app
     profiles: ["maintenance"]
     restart: "no"
-    command: ["python", "scripts/backup_db.py", "--source", "/app/data/app.db", "--target-dir", "/app/data/backups", "--retention", "14"]
+    command: ["python", "scripts/backup_db.py", "--source", "/app/data/app.db", "--target-dir", "/app/backups", "--replica-dir", "/app/backup-replica", "--retention", "14"]
     environment:
+      <<: *app-environment
       APP_ENV: production
       DATABASE_PATH: /app/data/app.db
-      BACKUP_ROOT: /app/data/backups
+      BACKUP_ROOT: /app/backups
+    volumes:
+      - ecommerce_ai_data:/app/data
+      - ecommerce_ai_backups:/app/backups
+      - type: bind
+        source: ${BACKUP_REPLICA_HOST_PATH:?BACKUP_REPLICA_HOST_PATH is required}
+        target: /app/backup-replica
 
 volumes:
   ecommerce_ai_data:
     name: cross-border-ai-data
+  ecommerce_ai_backups:
+    name: cross-border-ai-backups

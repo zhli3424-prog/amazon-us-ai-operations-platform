@@ -1,4 +1,29 @@
 const csrf = document.querySelector('meta[name="csrf-token"]').content;
+const permissions = new Set((document.querySelector('meta[name="permissions"]')?.content || '').split(',').filter(Boolean));
+
+function requiredPermission(url) {
+  const path = new URL(url, location.origin).pathname;
+  if (/\/(approve|reject|publish|verify)$/.test(path)) return 'approve';
+  if (path.startsWith('/api/channels/') || path.startsWith('/api/jobs/')) return 'channel.sync';
+  if (path.startsWith('/api/sync-failures/')) return 'sync_failure.manage';
+  if (path.startsWith('/api/purchase-order-items/') && path.endsWith('/receive')) return 'inventory.receive';
+  if (path === '/api/inventory-adjustments' || path.startsWith('/api/inventory-adjustments/')) return 'inventory.adjust';
+  if (path.startsWith('/api/replenishment-plans/') || path.startsWith('/api/purchase-orders/') || path.startsWith('/api/purchase-order-cancellations/')) return 'procurement.write';
+  if (path.startsWith('/api/listings/')) return 'listing.write';
+  if (path.startsWith('/api/tickets/') || path.startsWith('/api/service-actions/') || path.startsWith('/api/service-action-reversals/') || path.startsWith('/api/feedback')) return 'ticket.write';
+  if (path.startsWith('/api/products/') || path.startsWith('/api/import/')) return 'catalog.write';
+  if (path.startsWith('/api/admin/')) return '*';
+  return 'read';
+}
+
+function canUse(url) {
+  const required = requiredPermission(url);
+  return permissions.has('*') || permissions.has(required);
+}
+
+document.querySelectorAll('.api-form').forEach(form => { if (!canUse(form.action)) form.hidden = true; });
+document.querySelectorAll('[data-action]').forEach(button => { if (!canUse(button.dataset.action)) button.hidden = true; });
+document.querySelectorAll('[data-bulk-action]').forEach(button => { if (!canUse(button.dataset.bulkAction)) button.hidden = true; });
 
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 

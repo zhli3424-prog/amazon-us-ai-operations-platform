@@ -12,9 +12,44 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m py_compile app/main.py app/security.py app/worker.py scripts/*.py
-      - run: python -m pytest tests -q -p no:cacheprovider
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m pip_audit -r requirements.txt
+      - run: python -m compileall -q app scripts tests
+      - run: python -m pytest -q -p no:cacheprovider --cov=app --cov-report=term-missing --cov-fail-under=60
       - run: APP_ENV=testing DATABASE_PATH=/tmp/cross-border-ci.db ADMIN_PASSWORD='CiAdminPassword123' SESSION_SECRET='ci-session-secret-at-least-32-characters' python -m app.main init-db
       - run: python scripts/check_migrations.py --database /tmp/cross-border-ci.db
       - run: python scripts/backup_db.py --source /tmp/cross-border-ci.db --target-dir /tmp/cross-border-backups --retention 2
       - run: docker build -t cross-border-ai:test .
+      - name: Compose smoke test
+        env:
+          SESSION_SECRET: ci-session-secret-at-least-32-characters
+          MFA_ENCRYPTION_KEY: ci-mfa-secret-different-at-least-32-characters
+          AUDIT_SIGNING_KEY: ci-audit-secret-different-at-least-32-characters
+          PRIVACY_HASH_KEY: ci-privacy-secret-different-at-least-32-characters
+          HEALTH_TOKEN: ci-health-token-at-least-24-characters
+          ADMIN_PASSWORD: CiAdminPassword123
+          ALLOW_DEMO_AI: "true"
+          ATTACHMENT_SCANNER_URL: http://127.0.0.1:9/scan
+          ATTACHMENT_ENCRYPTION_KEY: ci-attachment-key-different-at-least-32-characters
+          BACKUP_REPLICA_HOST_PATH: ./.ci-backup-replica
+          AUDIT_CHECKPOINT_HOST_PATH: ./.ci-audit-checkpoints
+        run: |
+          mkdir -p .ci-backup-replica .ci-audit-checkpoints
+          docker compose -p cross-border-ai-ci up -d --build
+          for i in {1..30}; do curl -fsS http://127.0.0.1:8030/health/live && break; sleep 2; done
+          curl -fsS -H "X-Health-Token: $HEALTH_TOKEN" http://127.0.0.1:8030/health/ready
+      - name: Compose cleanup
+        if: always()
+        env:
+          SESSION_SECRET: ci-session-secret-at-least-32-characters
+          MFA_ENCRYPTION_KEY: ci-mfa-secret-different-at-least-32-characters
+          AUDIT_SIGNING_KEY: ci-audit-secret-different-at-least-32-characters
+          PRIVACY_HASH_KEY: ci-privacy-secret-different-at-least-32-characters
+          HEALTH_TOKEN: ci-health-token-at-least-24-characters
+          ADMIN_PASSWORD: CiAdminPassword123
+          ATTACHMENT_SCANNER_URL: http://127.0.0.1:9/scan
+          ATTACHMENT_ENCRYPTION_KEY: ci-attachment-key-different-at-least-32-characters
+          BACKUP_REPLICA_HOST_PATH: ./.ci-backup-replica
+          AUDIT_CHECKPOINT_HOST_PATH: ./.ci-audit-checkpoints
+        run: |
+          docker compose -p cross-border-ai-ci down -v

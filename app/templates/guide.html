@@ -1,0 +1,23 @@
+<section class="panel">
+  <div class="panel-head"><div><h2>先记住：这不是一堆孤立页面，而是两条运营闭环</h2><p>建议演示 12–15 分钟。每完成一步就勾选，进度只保存在当前浏览器。</p></div><a class="button-link" href="/dashboard">开始演示</a></div>
+  <div class="guide-map"><div class="guide-lane"><h3>增长闭环</h3><p>商品资料 → 选品判断 → 双语文案 → 异人审批 → 模拟发布</p></div><div class="guide-arrow">＋</div><div class="guide-lane"><h3>履约闭环</h3><p>订单/库存 → 补货采购 → 客服处置 → 评价整改 → 经营复盘</p></div></div>
+</section>
+<section class="panel"><h2>贯穿全程的三个规则</h2><div class="guide-rule"><div><b>数据先于 AI</b><span>先得到可信数据，AI 只基于已验证事实生成建议。</span></div><div><b>人控制关键动作</b><span>文案、退款、库存调整和采购都有审批门禁。</span></div><div><b>操作必须留痕</b><span>同步、状态变化、审批人和版本都进入审计记录。</span></div></div></section>
+
+{% set steps = [
+('准备演示账号','先准备操作账号和独立审批账号，后面的异人审批才能真实演示。','用管理员进入账号与安全，创建一个 operator 和一个 approver；分别登录一次并修改临时密码。','密码只保存 PBKDF2 哈希；角色权限由后台强制校验，不能只靠隐藏按钮。','用户状态、角色、最近登录、有效会话和创建审计。','我用不同账号演示经办与审批分离，不用管理员一人包办。','/settings','进入账号与安全'),
+('看全局状态','先确认店铺模式、待办、库存风险和异常，决定今天先处理什么。','打开仪表盘，查看顶部指标和“今日优先动作”。','聚合订单、利润、库存、工单、同步与通知。','仪表盘数字和通知可进入对应页面。','我先看经营全貌，再进入具体业务。','/dashboard','打开仪表盘'),
+('同步订单','订单是销量、退款额度和客服关联的事实来源。','在订单中心点击“同步亚马逊订单”。','按外部事件号幂等写入订单与商品明细。','订单状态、脱敏订单号、同步任务和审计记录。','重复同步不会重复累计，真实环境只需更换渠道适配器。','/orders','进入订单中心'),
+('维护商品与选品','商品主数据决定文案、成本、库存和采购是否可靠。','查看商品资料并执行选品分析；空库时导入 samples/products.csv。','按销量、利润率、评分和竞争度计算可解释分数。','商品版本、分数拆解、证据状态与审计事件。','选品由规则算分，不让模型拍脑袋。','/products','进入商品与选品'),
+('同步结算并看利润','销量高不等于赚钱，要看 SKU 贡献利润。','进入经营利润，同步结算流水并选择统计周期。','拆解采购、佣金、FBA、头程、广告和退款损失。','SKU 数据来源、费用拆解和统计周期。','这里回答每卖一件赚多少，但不冒充正式财务报表。','/profit','进入经营利润'),
+('生成双语文案','把已验证事实转成英文发布稿和中文运营审核稿。','在商品页点击“生成文案”，再打开智能商品文案。','AI 生成结构化双语字段，代码校验数量、长度和风险词。','AI 运行、合规错误、版本与证据快照。','AI 负责提效，规则负责边界，中文帮助审核。','/listings','查看智能商品文案'),
+('审批并模拟发布','证明生成者不能把内容直接上线。','保存草稿；换独立审批账号批准；再点击“模拟发布”。','检查版本、异人审批和合规门禁，固化发布快照。','审核历史、批准人、版本、发布记录和审计。','模拟发布只验证内部门禁，没有写入真实 Amazon。','/listings','执行审批流程'),
+('同步库存并补货','提前发现缺货，而不是等订单断货。','同步库存，查看可售天数；再进入采购补货。','只用可售库存计算天数，并结合交期、安全库存和 MOQ。','库存快照、趋势、补货计划、采购单和收货。','预警由代码计算，采购仍需申请、审批和收货。','/inventory','进入库存中心'),
+('处理客服事件','把退款和买家沟通变成有负责人、有 SLA 的工单。','先同步订单，再同步客户事件，生成回复建议并指派。','规则定 P0/P1/P2，AI 只生成英文建议和中文方案。','订单关联、时间线、附件、SLA 和售后审批。','系统不会自动联系买家，最终处置由人负责。','/tickets','进入客服工单'),
+('把评价变成整改','评价是商品层面的聚合信号，不是一对一工单。','同步评价主题，为负面问题建立整改行动。','按 ASIN 展示主题、提及次数、评分影响和趋势。','行动负责人、状态、截止时间和处理结果。','评价洞察与客服分开，避免伪造客户会话。','/feedback','进入反馈洞察'),
+('处置同步异常','渠道脏数据不能悄悄丢失。','查看失败原因；修复来源后重试，或填写说明处理。','错误行隔离，重试重新读取权威渠道数据。','事件号、错误码、任务、处理人与说明。','成功数据继续落库，失败数据进入处置工作台。','/sync-failures','查看同步异常'),
+('审计收尾','证明刚才的关键动作是谁、何时、对什么对象做的。','打开审计记录，按时间倒序复盘刚才的操作。','审计事件形成哈希链并可写外部签名检查点。','操作人、动作、对象、请求编号、时间和校验。','流程不是点完就结束，而是能复盘、能追责。','/audit','查看审计记录')
+] %}
+<div class="guide-steps">{% for title,purpose,operator,system,evidence,say,href,button in steps %}<section class="panel guide-step"><h2>{{ title }}</h2><p class="guide-purpose">{{ purpose }}</p><div class="guide-detail"><div><b>你要做什么</b>{{ operator }}</div><div><b>系统做什么</b>{{ system }}</div><div><b>证据在哪里</b>{{ evidence }}</div></div><p class="guide-say"><b>演示时这样说：</b>“{{ say }}”</p><div class="guide-actions"><label class="guide-check"><input type="checkbox" data-guide-check="{{ loop.index }}">这一步我已完成</label><a class="button-link secondary" href="{{ href }}">{{ button }} →</a></div></section>{% endfor %}</div>
+<section class="panel warning"><h2>不要说错的边界</h2><p>不要说“已经连接 Amazon”“AI 自动发布”“AI 自动退款”或“这是财务报表”。正确说法：当前用模拟 SP-API 数据验证完整内部流程；真实授权尚未接入；发布和售后动作由人工审批；利润页是运营贡献利润分析。</p></section>
+<script>document.addEventListener('DOMContentLoaded',()=>document.querySelectorAll('[data-guide-check]').forEach(box=>{const key='guide-step-'+box.dataset.guideCheck;box.checked=localStorage.getItem(key)==='1';box.addEventListener('change',()=>localStorage.setItem(key,box.checked?'1':'0'))}))</script>

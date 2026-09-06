@@ -52,6 +52,8 @@ def read_session(token: str | None, secret: str) -> dict[str, Any] | None:
 
 
 def required_role(method: str, path: str) -> str:
+    if path in {"/health", "/health/metrics", "/api/admin/audit/verify"}:
+        return "admin"
     if method == "GET":
         return "viewer"
     if path.startswith("/api/account/"):
@@ -63,6 +65,36 @@ def required_role(method: str, path: str) -> str:
     if any(path.endswith(action) for action in ("/approve", "/reject", "/publish", "/verify")):
         return "approver"
     return "operator"
+
+
+def required_permission(method: str, path: str) -> str:
+    if method == "GET":
+        return "read"
+    if path.startswith("/api/admin/"):
+        return "*"
+    if any(path.endswith(action) for action in ("/approve", "/reject", "/publish", "/verify")):
+        return "approve"
+    if path.startswith("/api/channels/") or path.startswith("/api/jobs/"):
+        return "channel.sync"
+    if path.startswith("/api/sync-failures/"):
+        return "sync_failure.manage"
+    if path.startswith("/api/purchase-order-items/") and path.endswith("/receive"):
+        return "inventory.receive"
+    if path == "/api/inventory-adjustments" or path.startswith("/api/inventory-adjustments/"):
+        return "inventory.adjust"
+    if path.startswith("/api/purchase-order-cancellations/"):
+        return "procurement.write"
+    if path.startswith("/api/service-action-reversals/"):
+        return "ticket.write"
+    if path.startswith("/api/replenishment-plans/") or path.startswith("/api/purchase-orders/"):
+        return "procurement.write"
+    if path.startswith("/api/listings/"):
+        return "listing.write"
+    if path.startswith("/api/tickets/") or path.startswith("/api/service-actions/") or path.startswith("/api/feedback"):
+        return "ticket.write"
+    if path.startswith("/api/products/") or path.startswith("/api/import/"):
+        return "catalog.write"
+    return "read"
 
 
 def role_allows(actual: str, required: str) -> bool:

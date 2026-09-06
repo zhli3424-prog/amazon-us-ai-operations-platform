@@ -1,0 +1,12 @@
+<section class="panel">
+  <div class="panel-head"><div><h2>库存纠错</h2><p>用于盘点差异、破损报废等本地仓修正；申请人与批准人必须不同。不会修改 FBA 可售库存。</p></div><span class="badge warning">受审批控制</span></div>
+  <form class="api-form inline" action="/api/inventory-adjustments">
+    <select name="sku" required><option value="">选择 SKU</option>{% for p in products %}<option value="{{ p.sku }}">{{ p.sku }} · {{ p.source_title }}</option>{% endfor %}</select>
+    <input type="number" name="quantity_delta" placeholder="调整数，可为负数" required><input name="reason" minlength="3" placeholder="盘点单号与差异原因" required><button>提交纠错申请</button>
+  </form>
+  <div class="workflow-list">{% for item in inventory_adjustments %}<div class="workflow-row">
+    <div><b>#{{ item.id }} · {{ item.sku }} · {{ '%+d'|format(item.quantity_delta) }}</b><small>{{ item.reason }} · 申请人 {{ item.requested_by }}</small></div>
+    <span class="badge {{ 'healthy' if item.status == 'applied' else 'warning' }}">{{ item.status }}</span>
+    <div>{% if item.status == 'requested' %}<button type="button" data-action="/api/inventory-adjustments/{{ item.id }}/approve">批准</button>{% elif item.status == 'approved' %}<button type="button" data-action="/api/inventory-adjustments/{{ item.id }}/apply">执行调整</button>{% endif %}</div>
+  </div>{% else %}<p class="empty">暂无库存纠错记录。</p>{% endfor %}</div>
+</section>

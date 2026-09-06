@@ -19,32 +19,68 @@ from contextlib import asynccontextmanager, closing
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
+from app.channels import DemoAmazonAdapter, HttpAmazonAdapter
+from app.domain import allocate_cents, cents_to_money, event_ticket_rules, inventory_status, money_to_cents, ticket_due_at, ticket_rules
+from app.migrations import BASELINE_VERSION, apply_migrations
 from PIL import Image, UnidentifiedImageError
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.security import create_session, generate_totp_secret, hash_password, read_session, required_role, role_allows, totp_code, verify_password, verify_totp
+from app.security import create_session, generate_totp_secret, hash_password, read_session, required_permission, required_role, role_allows, totp_code, verify_password, verify_totp
 
 
 ROOT = Path(__file__).resolve().parent.parent
 MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", str(ROOT / "data" / "media"))).resolve()
 PRIVATE_ROOT = Path(os.getenv("PRIVATE_ROOT", str(ROOT / "data" / "private"))).resolve()
 BACKUP_ROOT = Path(os.getenv("BACKUP_ROOT", str(ROOT / "backups"))).resolve()
+BACKUP_REPLICA_PATH = Path(os.getenv("BACKUP_REPLICA_PATH", str(BACKUP_ROOT / "replica"))).resolve()
+BACKUP_MAX_AGE_HOURS = max(1, int(os.getenv("BACKUP_MAX_AGE_HOURS", "26")))
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+MIGRATE_ON_STARTUP = os.getenv("MIGRATE_ON_STARTUP", "true" if APP_ENV != "production" else "false").strip().lower() == "true"
 SESSION_SECRET = os.getenv("SESSION_SECRET", "local-development-secret-change-before-deploy")
+SESSION_SECRET_PREVIOUS = os.getenv("SESSION_SECRET_PREVIOUS", "").strip()
 MFA_ENCRYPTION_KEY = os.getenv("MFA_ENCRYPTION_KEY", SESSION_SECRET if APP_ENV != "production" else "")
+MFA_ENCRYPTION_KEY_PREVIOUS = os.getenv("MFA_ENCRYPTION_KEY_PREVIOUS", "").strip()
 SYNC_INLINE = os.getenv("SYNC_INLINE", "true" if APP_ENV != "production" else "false").strip().lower() == "true"
 ATTACHMENT_SCANNER_URL = os.getenv("ATTACHMENT_SCANNER_URL", "").strip()
+ATTACHMENT_ENCRYPTION_KEY = os.getenv("ATTACHMENT_ENCRYPTION_KEY", SESSION_SECRET if APP_ENV != "production" else "").strip()
+ATTACHMENT_ENCRYPTION_KEY_PREVIOUS = os.getenv("ATTACHMENT_ENCRYPTION_KEY_PREVIOUS", "").strip()
 ATTACHMENT_RETENTION_DAYS = max(1, int(os.getenv("ATTACHMENT_RETENTION_DAYS", "365")))
+CUSTOMER_RETENTION_DAYS = max(30, int(os.getenv("CUSTOMER_RETENTION_DAYS", "730")))
+SYNC_FAILURE_RETENTION_DAYS = max(1, int(os.getenv("SYNC_FAILURE_RETENTION_DAYS", "30")))
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+ALERT_WEBHOOK_SIGNING_KEY = os.getenv("ALERT_WEBHOOK_SIGNING_KEY", "").strip()
+AUDIT_SIGNING_KEY = os.getenv("AUDIT_SIGNING_KEY", SESSION_SECRET if APP_ENV != "production" else "")
+AUDIT_CHECKPOINT_PATH = Path(os.getenv("AUDIT_CHECKPOINT_PATH")).resolve() if os.getenv("AUDIT_CHECKPOINT_PATH") else None
+PRIVACY_HASH_KEY = os.getenv("PRIVACY_HASH_KEY", AUDIT_SIGNING_KEY if APP_ENV != "production" else "")
+HEALTH_TOKEN = os.getenv("HEALTH_TOKEN", "").strip()
+CHANNEL_ADAPTER = os.getenv("CHANNEL_ADAPTER", "demo").strip().lower()
+TRUSTED_PROXY_IPS = {value.strip() for value in os.getenv("TRUSTED_PROXY_IPS", "").split(",") if value.strip()}
+DISPLAY_TIMEZONE_NAME = os.getenv("DISPLAY_TIMEZONE", "Asia/Shanghai").strip()
+BUSINESS_TIMEZONE_NAME = os.getenv("BUSINESS_TIMEZONE", "America/Los_Angeles").strip()
+try:
+    DISPLAY_TIMEZONE = ZoneInfo(DISPLAY_TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    DISPLAY_TIMEZONE = timezone.utc
+try:
+    BUSINESS_TIMEZONE = ZoneInfo(BUSINESS_TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    BUSINESS_TIMEZONE = timezone.utc
+APPROVER_LIMIT_CENTS = max(0, int(Decimal(os.getenv("APPROVER_LIMIT_USD", "500")) * 100))
+MAX_REQUEST_BYTES = max(1024, int(os.getenv("MAX_REQUEST_BYTES", str(12 * 1024 * 1024))))
 request_actor: ContextVar[str] = ContextVar("request_actor", default="system")
 request_trace: ContextVar[str] = ContextVar("request_trace", default="startup")
+active_channel_mode: ContextVar[str] = ContextVar("active_channel_mode", default="demo_sp_api")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("cross_border_ops")
 SCHEMA = """
@@ -57,6 +93,8 @@ CREATE TABLE IF NOT EXISTS products (
     category TEXT NOT NULL,
     price REAL NOT NULL CHECK(price >= 0),
     cost REAL NOT NULL CHECK(cost >= 0),
+    price_cents INTEGER NOT NULL DEFAULT 0,
+    cost_cents INTEGER NOT NULL DEFAULT 0,
     monthly_sales REAL NOT NULL CHECK(monthly_sales >= 0),
     rating REAL NOT NULL CHECK(rating BETWEEN 0 AND 5),
     review_count INTEGER NOT NULL CHECK(review_count >= 0),
@@ -105,6 +143,8 @@ CREATE TABLE IF NOT EXISTS listings (
     provider TEXT NOT NULL,
     review_notes_cn TEXT,
     version INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL DEFAULT 'system:legacy',
+    edited_by TEXT,
     approved_by TEXT,
     approved_at TEXT,
     rejection_reason TEXT,
@@ -322,6 +362,11 @@ CREATE TABLE IF NOT EXISTS orders (
     tax_total REAL NOT NULL DEFAULT 0 CHECK(tax_total >= 0),
     promotion_total REAL NOT NULL DEFAULT 0 CHECK(promotion_total >= 0),
     refund_total REAL NOT NULL DEFAULT 0 CHECK(refund_total >= 0),
+    item_total_cents INTEGER NOT NULL DEFAULT 0,
+    shipping_total_cents INTEGER NOT NULL DEFAULT 0,
+    tax_total_cents INTEGER NOT NULL DEFAULT 0,
+    promotion_total_cents INTEGER NOT NULL DEFAULT 0,
+    refund_total_cents INTEGER NOT NULL DEFAULT 0,
     buyer_alias TEXT NOT NULL,
     synced_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1
@@ -338,6 +383,10 @@ CREATE TABLE IF NOT EXISTS order_items (
     item_tax REAL NOT NULL DEFAULT 0 CHECK(item_tax >= 0),
     promotion_discount REAL NOT NULL DEFAULT 0 CHECK(promotion_discount >= 0),
     item_status TEXT NOT NULL
+    ,item_price_cents INTEGER NOT NULL DEFAULT 0
+    ,item_tax_cents INTEGER NOT NULL DEFAULT 0
+    ,promotion_discount_cents INTEGER NOT NULL DEFAULT 0
+    ,unit_cost_cents INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS returns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -349,6 +398,7 @@ CREATE TABLE IF NOT EXISTS returns (
     reason_text TEXT NOT NULL,
     quantity INTEGER NOT NULL CHECK(quantity > 0),
     refund_amount REAL NOT NULL DEFAULT 0 CHECK(refund_amount >= 0),
+    refund_amount_cents INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK(status IN ('requested','authorized','in_transit','received','refunded','closed')),
     carrier TEXT,
     tracking_masked TEXT,
@@ -390,6 +440,8 @@ CREATE TABLE IF NOT EXISTS service_actions (
     order_id INTEGER REFERENCES orders(id),
     action_type TEXT NOT NULL CHECK(action_type IN ('refund','reship','replacement','cancel')),
     amount REAL NOT NULL DEFAULT 0 CHECK(amount >= 0),
+    amount_cents INTEGER NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'USD',
     reason TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('requested','approved','completed','cancelled')),
     requested_by TEXT NOT NULL,
@@ -397,6 +449,7 @@ CREATE TABLE IF NOT EXISTS service_actions (
     requested_at TEXT NOT NULL,
     approved_at TEXT,
     completed_at TEXT
+    ,version INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS suppliers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -433,6 +486,7 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     status TEXT NOT NULL CHECK(status IN ('draft','approved','sent_demo','partially_received','received','cancelled')),
     currency TEXT NOT NULL,
     total_amount REAL NOT NULL CHECK(total_amount >= 0),
+    total_amount_cents INTEGER NOT NULL DEFAULT 0,
     expected_at TEXT,
     created_by TEXT NOT NULL,
     approved_by TEXT,
@@ -450,6 +504,7 @@ CREATE TABLE IF NOT EXISTS purchase_order_items (
     received_qty INTEGER NOT NULL DEFAULT 0 CHECK(received_qty >= 0),
     rejected_qty INTEGER NOT NULL DEFAULT 0 CHECK(rejected_qty >= 0),
     unit_cost REAL NOT NULL CHECK(unit_cost >= 0)
+    ,unit_cost_cents INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS warehouse_inventory (
     sku TEXT PRIMARY KEY,
@@ -491,6 +546,20 @@ CREATE TABLE IF NOT EXISTS cost_profiles (
     effective_from TEXT NOT NULL,
     updated_by TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cost_profile_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    referral_rate REAL NOT NULL CHECK(referral_rate BETWEEN 0 AND 1),
+    fba_fee_per_unit_cents INTEGER NOT NULL CHECK(fba_fee_per_unit_cents >= 0),
+    inbound_cost_per_unit_cents INTEGER NOT NULL CHECK(inbound_cost_per_unit_cents >= 0),
+    ad_rate REAL NOT NULL CHECK(ad_rate BETWEEN 0 AND 1),
+    other_cost_per_unit_cents INTEGER NOT NULL DEFAULT 0 CHECK(other_cost_per_unit_cents >= 0),
+    product_cost_per_unit_cents INTEGER NOT NULL CHECK(product_cost_per_unit_cents >= 0),
+    effective_from TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(product_id,effective_from)
 );
 CREATE TABLE IF NOT EXISTS financial_transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -632,11 +701,16 @@ def now() -> str:
 
 
 def display_time(value: str | None) -> str:
-    return value[:16].replace("T", " ") + " UTC" if value else "尚未同步"
+    if not value:
+        return "尚未同步"
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M") + f" {DISPLAY_TIMEZONE_NAME}"
 
 
-def mfa_cipher() -> Fernet:
-    key = base64.urlsafe_b64encode(hashlib.sha256(MFA_ENCRYPTION_KEY.encode("utf-8")).digest())
+def mfa_cipher(encryption_key: str | None = None) -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256((encryption_key or MFA_ENCRYPTION_KEY).encode("utf-8")).digest())
     return Fernet(key)
 
 
@@ -647,10 +721,29 @@ def encrypt_mfa_secret(secret: str) -> str:
 def decrypt_mfa_secret(value: str) -> str:
     if not value.startswith("gAAAA"):
         return value  # migration compatibility; next successful setup rewrites it encrypted
-    try:
-        return mfa_cipher().decrypt(value.encode("ascii")).decode("utf-8")
-    except InvalidToken as exc:
-        raise RuntimeError("MFA 密钥无法解密，请联系管理员重置 MFA") from exc
+    for encryption_key in (MFA_ENCRYPTION_KEY, MFA_ENCRYPTION_KEY_PREVIOUS):
+        if not encryption_key:
+            continue
+        try:
+            return mfa_cipher(encryption_key).decrypt(value.encode("ascii")).decode("utf-8")
+        except InvalidToken:
+            continue
+    raise RuntimeError("MFA 密钥无法解密，请联系管理员重置 MFA")
+
+
+def attachment_cipher(encryption_key: str | None = None) -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256((encryption_key or ATTACHMENT_ENCRYPTION_KEY).encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def decrypt_attachment(content: bytes) -> bytes:
+    for encryption_key in (ATTACHMENT_ENCRYPTION_KEY, ATTACHMENT_ENCRYPTION_KEY_PREVIOUS):
+        if encryption_key:
+            try:
+                return attachment_cipher(encryption_key).decrypt(content)
+            except InvalidToken:
+                continue
+    raise RuntimeError("附件密钥无法解密")
 
 
 def db_path() -> Path:
@@ -684,6 +777,28 @@ def validate_runtime_config() -> None:
         errors.append("SQLite 部署仅支持单 Web 进程；多进程前请迁移 PostgreSQL")
     if not ATTACHMENT_SCANNER_URL:
         errors.append("生产环境必须配置 ATTACHMENT_SCANNER_URL，未通过恶意文件扫描的附件不得落盘")
+    if len(ATTACHMENT_ENCRYPTION_KEY) < 32 or ATTACHMENT_ENCRYPTION_KEY in {SESSION_SECRET, MFA_ENCRYPTION_KEY}:
+        errors.append("ATTACHMENT_ENCRYPTION_KEY 必须是独立的至少 32 位密钥")
+    if len(AUDIT_SIGNING_KEY) < 32 or AUDIT_SIGNING_KEY in {SESSION_SECRET, MFA_ENCRYPTION_KEY}:
+        errors.append("AUDIT_SIGNING_KEY 必须是独立的至少 32 位密钥")
+    if not AUDIT_CHECKPOINT_PATH:
+        errors.append("生产环境必须配置外部 AUDIT_CHECKPOINT_PATH")
+    elif AUDIT_CHECKPOINT_PATH.is_relative_to(db_path().parent) or AUDIT_CHECKPOINT_PATH.is_relative_to(BACKUP_ROOT):
+        errors.append("AUDIT_CHECKPOINT_PATH 必须位于数据库和主备份目录之外")
+    if len(PRIVACY_HASH_KEY) < 32 or PRIVACY_HASH_KEY in {SESSION_SECRET, MFA_ENCRYPTION_KEY, AUDIT_SIGNING_KEY}:
+        errors.append("PRIVACY_HASH_KEY 必须是独立的至少 32 位密钥")
+    if len(HEALTH_TOKEN) < 24:
+        errors.append("HEALTH_TOKEN 必须至少 24 位")
+    if ALERT_WEBHOOK_URL and len(ALERT_WEBHOOK_SIGNING_KEY) < 32:
+        errors.append("配置告警 Webhook 时必须设置至少 32 位 ALERT_WEBHOOK_SIGNING_KEY")
+    if DISPLAY_TIMEZONE is timezone.utc and DISPLAY_TIMEZONE_NAME != "UTC":
+        errors.append("DISPLAY_TIMEZONE 不是有效的 IANA 时区")
+    if BUSINESS_TIMEZONE is timezone.utc and BUSINESS_TIMEZONE_NAME != "UTC":
+        errors.append("BUSINESS_TIMEZONE 不是有效的 IANA 时区")
+    if CHANNEL_ADAPTER == "http" and (not os.getenv("AMAZON_ADAPTER_BASE_URL") or not os.getenv("AMAZON_ADAPTER_TOKEN")):
+        errors.append("HTTP 渠道适配器缺少网关地址或令牌")
+    if BACKUP_REPLICA_PATH == BACKUP_ROOT or BACKUP_REPLICA_PATH.is_relative_to(BACKUP_ROOT) or BACKUP_REPLICA_PATH.is_relative_to(db_path().parent):
+        errors.append("BACKUP_REPLICA_PATH 必须位于数据库和主备份目录之外")
     if errors:
         raise RuntimeError("生产配置校验失败: " + "; ".join(errors))
 
@@ -691,8 +806,10 @@ def validate_runtime_config() -> None:
 def init_db() -> None:
     with closing(connect()) as conn:
         conn.executescript(SCHEMA)
-        conn.execute("DROP TRIGGER IF EXISTS audit_no_update")
-        conn.execute("DROP TRIGGER IF EXISTS audit_no_delete")
+        legacy_bootstrap = not conn.execute("SELECT 1 FROM schema_migrations LIMIT 1").fetchone()
+        if legacy_bootstrap:
+            conn.execute("DROP TRIGGER IF EXISTS audit_no_update")
+            conn.execute("DROP TRIGGER IF EXISTS audit_no_delete")
         product_columns = {row[1] for row in conn.execute("PRAGMA table_info(products)")}
         for name, definition in {
             "brand": "TEXT NOT NULL DEFAULT ''", "parent_sku": "TEXT",
@@ -707,7 +824,7 @@ def init_db() -> None:
             "version": "INTEGER NOT NULL DEFAULT 1", "updated_at": "TEXT",
             "score_basis": "TEXT NOT NULL DEFAULT '店内运营数据'",
         }.items():
-            if name not in product_columns:
+            if legacy_bootstrap and name not in product_columns:
                 conn.execute(f"ALTER TABLE products ADD COLUMN {name} {definition}")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tickets)")}
         for name, definition in {
@@ -722,40 +839,41 @@ def init_db() -> None:
             "attachments": "TEXT NOT NULL DEFAULT '[]'", "escalation_level": "TEXT NOT NULL DEFAULT 'none'",
             "reopen_count": "INTEGER NOT NULL DEFAULT 0",
         }.items():
-            if name not in columns:
+            if legacy_bootstrap and name not in columns:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {name} {definition}")
         listing_columns = {row[1] for row in conn.execute("PRAGMA table_info(listings)")}
         for name, definition in {
             "review_notes_cn": "TEXT", "version": "INTEGER NOT NULL DEFAULT 1", "approved_by": "TEXT", "approved_at": "TEXT",
+            "created_by": "TEXT NOT NULL DEFAULT 'system:legacy'", "edited_by": "TEXT",
             "title_zh": "TEXT", "bullet_points_zh": "TEXT", "description_zh": "TEXT", "search_terms_zh": "TEXT",
             "rejection_reason": "TEXT",
             "evidence_snapshot": "TEXT NOT NULL DEFAULT '[]'", "compliance_status": "TEXT NOT NULL DEFAULT 'needs_review'",
             "compliance_errors": "TEXT NOT NULL DEFAULT '[]'",
             "prompt_version": "TEXT NOT NULL DEFAULT 'listing-v1'",
         }.items():
-            if name not in listing_columns:
+            if legacy_bootstrap and name not in listing_columns:
                 conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {definition}")
         audit_columns = {row[1] for row in conn.execute("PRAGMA table_info(audit_events)")}
         for name, definition in {"actor": "TEXT NOT NULL DEFAULT 'system'", "request_id": "TEXT NOT NULL DEFAULT 'legacy'"}.items():
-            if name not in audit_columns:
+            if legacy_bootstrap and name not in audit_columns:
                 conn.execute(f"ALTER TABLE audit_events ADD COLUMN {name} {definition}")
         user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         for name, definition in {
             "must_change_password": "INTEGER NOT NULL DEFAULT 0", "mfa_secret": "TEXT",
             "mfa_enabled": "INTEGER NOT NULL DEFAULT 0", "password_changed_at": "TEXT", "last_login_at": "TEXT",
         }.items():
-            if name not in user_columns:
+            if legacy_bootstrap and name not in user_columns:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
         connection_columns = {row[1] for row in conn.execute("PRAGMA table_info(channel_connections)")}
         for column in ("last_order_sync_at", "last_finance_sync_at", "last_market_sync_at"):
-            if column not in connection_columns:
+            if legacy_bootstrap and column not in connection_columns:
                 conn.execute(f"ALTER TABLE channel_connections ADD COLUMN {column} TEXT")
         job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
         for name, definition in {
             "progress": "INTEGER NOT NULL DEFAULT 0", "current_step": "TEXT NOT NULL DEFAULT '等待执行'",
             "result": "TEXT", "heartbeat_at": "TEXT",
         }.items():
-            if name not in job_columns:
+            if legacy_bootstrap and name not in job_columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
         ai_columns = {row[1] for row in conn.execute("PRAGMA table_info(ai_runs)")}
         for name, definition in {
@@ -763,22 +881,44 @@ def init_db() -> None:
             "input_tokens": "INTEGER NOT NULL DEFAULT 0", "output_tokens": "INTEGER NOT NULL DEFAULT 0",
             "estimated_cost_usd": "REAL NOT NULL DEFAULT 0",
         }.items():
-            if name not in ai_columns:
+            if legacy_bootstrap and name not in ai_columns:
                 conn.execute(f"ALTER TABLE ai_runs ADD COLUMN {name} {definition}")
         finance_columns = {row[1] for row in conn.execute("PRAGMA table_info(financial_transactions)")}
-        if "amount_cents" not in finance_columns:
+        if legacy_bootstrap and "amount_cents" not in finance_columns:
             conn.execute("ALTER TABLE financial_transactions ADD COLUMN amount_cents INTEGER NOT NULL DEFAULT 0")
             conn.execute("UPDATE financial_transactions SET amount_cents=CAST(ROUND(amount * 100) AS INTEGER)")
+        for table, definitions in {
+            "products": {"price_cents": "INTEGER NOT NULL DEFAULT 0", "cost_cents": "INTEGER NOT NULL DEFAULT 0"},
+            "orders": {"item_total_cents": "INTEGER NOT NULL DEFAULT 0", "shipping_total_cents": "INTEGER NOT NULL DEFAULT 0", "tax_total_cents": "INTEGER NOT NULL DEFAULT 0", "promotion_total_cents": "INTEGER NOT NULL DEFAULT 0", "refund_total_cents": "INTEGER NOT NULL DEFAULT 0"},
+            "order_items": {"item_price_cents": "INTEGER NOT NULL DEFAULT 0", "item_tax_cents": "INTEGER NOT NULL DEFAULT 0", "promotion_discount_cents": "INTEGER NOT NULL DEFAULT 0", "unit_cost_cents": "INTEGER NOT NULL DEFAULT 0"},
+            "returns": {"refund_amount_cents": "INTEGER NOT NULL DEFAULT 0"},
+            "service_actions": {"amount_cents": "INTEGER NOT NULL DEFAULT 0", "currency": "TEXT NOT NULL DEFAULT 'USD'", "version": "INTEGER NOT NULL DEFAULT 1"},
+            "purchase_orders": {"total_amount_cents": "INTEGER NOT NULL DEFAULT 0"},
+            "purchase_order_items": {"unit_cost_cents": "INTEGER NOT NULL DEFAULT 0"},
+        }.items():
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in definitions.items():
+                if legacy_bootstrap and name not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        conn.execute("UPDATE orders SET item_total_cents=CAST(ROUND(item_total*100) AS INTEGER),shipping_total_cents=CAST(ROUND(shipping_total*100) AS INTEGER),tax_total_cents=CAST(ROUND(tax_total*100) AS INTEGER),promotion_total_cents=CAST(ROUND(promotion_total*100) AS INTEGER),refund_total_cents=CAST(ROUND(refund_total*100) AS INTEGER) WHERE item_total_cents=0 AND (item_total<>0 OR shipping_total<>0 OR tax_total<>0 OR promotion_total<>0 OR refund_total<>0)")
+        conn.execute("UPDATE products SET price_cents=CAST(ROUND(price*100) AS INTEGER),cost_cents=CAST(ROUND(cost*100) AS INTEGER) WHERE price_cents=0 OR cost_cents=0")
+        conn.execute("UPDATE order_items SET item_price_cents=CAST(ROUND(item_price*100) AS INTEGER),item_tax_cents=CAST(ROUND(item_tax*100) AS INTEGER),promotion_discount_cents=CAST(ROUND(promotion_discount*100) AS INTEGER),unit_cost_cents=CAST(ROUND((SELECT cost FROM products WHERE products.id=order_items.product_id)*100) AS INTEGER) WHERE item_price_cents=0")
+        conn.execute("UPDATE returns SET refund_amount_cents=CAST(ROUND(refund_amount*100) AS INTEGER) WHERE refund_amount_cents=0 AND refund_amount<>0")
+        conn.execute("UPDATE service_actions SET amount_cents=CAST(ROUND(amount*100) AS INTEGER),currency=COALESCE((SELECT currency FROM orders WHERE orders.id=service_actions.order_id),'USD') WHERE amount_cents=0 AND amount<>0")
+        conn.execute("UPDATE purchase_orders SET total_amount_cents=CAST(ROUND(total_amount*100) AS INTEGER) WHERE total_amount_cents=0 AND total_amount<>0")
+        conn.execute("UPDATE purchase_order_items SET unit_cost_cents=CAST(ROUND(unit_cost*100) AS INTEGER) WHERE unit_cost_cents=0 AND unit_cost<>0")
+        conn.execute("""INSERT OR IGNORE INTO cost_profile_versions(product_id,referral_rate,fba_fee_per_unit_cents,inbound_cost_per_unit_cents,ad_rate,other_cost_per_unit_cents,product_cost_per_unit_cents,effective_from,created_by,created_at)
+            SELECT cp.product_id,cp.referral_rate,CAST(ROUND(cp.fba_fee_per_unit*100) AS INTEGER),CAST(ROUND(cp.inbound_cost_per_unit*100) AS INTEGER),cp.ad_rate,CAST(ROUND(cp.other_cost_per_unit*100) AS INTEGER),p.cost_cents,cp.effective_from,cp.updated_by,cp.updated_at FROM cost_profiles cp JOIN products p ON p.id=cp.product_id""")
         po_item_columns = {row[1] for row in conn.execute("PRAGMA table_info(purchase_order_items)")}
-        if "rejected_qty" not in po_item_columns:
+        if legacy_bootstrap and "rejected_qty" not in po_item_columns:
             conn.execute("ALTER TABLE purchase_order_items ADD COLUMN rejected_qty INTEGER NOT NULL DEFAULT 0")
         attachment_columns = {row[1] for row in conn.execute("PRAGMA table_info(ticket_attachments)")}
         for name, definition in (("sha256", "TEXT NOT NULL DEFAULT ''"), ("scan_status", "TEXT NOT NULL DEFAULT 'clean'"), ("expires_at", "TEXT"), ("deleted_at", "TEXT")):
-            if name not in attachment_columns:
+            if legacy_bootstrap and name not in attachment_columns:
                 conn.execute(f"ALTER TABLE ticket_attachments ADD COLUMN {name} {definition}")
         audit_columns = {row[1] for row in conn.execute("PRAGMA table_info(audit_events)")}
         for name in ("previous_hash", "event_hash"):
-            if name not in audit_columns:
+            if legacy_bootstrap and name not in audit_columns:
                 conn.execute(f"ALTER TABLE audit_events ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
         previous_hash = ""
         for event in conn.execute("SELECT id,action,entity_type,entity_id,detail,created_at,actor,request_id,event_hash FROM audit_events ORDER BY id"):
@@ -838,24 +978,22 @@ def init_db() -> None:
         conn.execute("INSERT OR IGNORE INTO users(username,password_hash,role,is_active,created_at,must_change_password) VALUES(?,?,?,?,?,?)", (os.getenv("ADMIN_USERNAME", "admin"), hash_password(admin_password), "admin", 1, now(), 1 if APP_ENV == "production" else 0))
         if APP_ENV == "production":
             conn.execute("UPDATE users SET must_change_password=1 WHERE role='admin' AND password_changed_at IS NULL")
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(6,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(7,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(11,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(12,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(13,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(14,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(15,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(16,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(17,?)", (now(),))
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(18,?)", (now(),))
+        if not conn.execute("SELECT 1 FROM schema_migrations LIMIT 1").fetchone():
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (BASELINE_VERSION, now()))
+        conn.commit()
+        apply_migrations(conn, ROOT / "migrations")
+        if ATTACHMENT_ENCRYPTION_KEY:
+            for attachment in conn.execute("SELECT id,stored_name,encrypted FROM ticket_attachments WHERE deleted_at IS NULL AND encrypted=0"):
+                target = (PRIVATE_ROOT / attachment["stored_name"]).resolve()
+                if target.is_relative_to(PRIVATE_ROOT) and target.is_file():
+                    raw = target.read_bytes()
+                    encrypted = raw if raw.startswith(b"gAAAA") else attachment_cipher().encrypt(raw)
+                    temporary = target.with_suffix(target.suffix + ".encrypting")
+                    temporary.write_bytes(encrypted)
+                    temporary.replace(target)
+                    conn.execute("UPDATE ticket_attachments SET encrypted=1 WHERE id=?", (attachment["id"],))
+        conn.execute("INSERT INTO data_retention_policies(data_type,retention_days,action,updated_by,updated_at) VALUES('customer_records',?,'anonymize','system:config',?) ON CONFLICT(data_type) DO UPDATE SET retention_days=excluded.retention_days,updated_at=excluded.updated_at", (CUSTOMER_RETENTION_DAYS, now()))
+        conn.execute("INSERT INTO data_retention_policies(data_type,retention_days,action,updated_by,updated_at) VALUES('sync_failures',?,'delete','system:config',?) ON CONFLICT(data_type) DO UPDATE SET retention_days=excluded.retention_days,updated_at=excluded.updated_at", (SYNC_FAILURE_RETENTION_DAYS, now()))
         conn.execute("""INSERT OR IGNORE INTO cost_profiles(product_id,referral_rate,fba_fee_per_unit,inbound_cost_per_unit,ad_rate,other_cost_per_unit,effective_from,updated_by,updated_at)
             SELECT id,0.15,3.40 + MIN(price * 0.04,2.0),MAX(0.55,cost * 0.12),0.08 + competition_score / 100 * 0.08,0,created_at,'system:migration',COALESCE(updated_at,created_at) FROM products""")
         for supplier in (
@@ -874,9 +1012,10 @@ def init_db() -> None:
             conn.execute("INSERT OR IGNORE INTO category_compliance_rules(category_keyword,prohibited_terms,required_evidence_fields,guidance_cn) VALUES(?,?,?,?)", (rule[0], json.dumps(rule[1]), json.dumps(rule[2]), rule[3]))
         for term, risk, note in (("amazon", "review", "平台商标仅能在允许语境使用"), ("kindle", "block", "非授权商品不得使用 Kindle 商标"), ("prime", "block", "不得在商品文案中暗示 Prime 资格")):
             conn.execute("INSERT OR IGNORE INTO trademark_watchlist(term,risk_level,note) VALUES(?,?,?)", (term, risk, note))
-        conn.execute(
-            "INSERT OR IGNORE INTO channel_connections(channel,marketplace,mode,status) VALUES('amazon-us','Amazon US','demo_sp_api','connected_demo')"
-        )
+        configured_mode = "demo_sp_api" if CHANNEL_ADAPTER == "demo" else "amazon_sp_api_gateway"
+        configured_status = "connected_demo" if CHANNEL_ADAPTER == "demo" else "configured"
+        conn.execute("INSERT OR IGNORE INTO channel_connections(channel,marketplace,mode,status) VALUES('amazon-us','Amazon US',?,?)", (configured_mode, configured_status))
+        conn.execute("UPDATE channel_connections SET status=CASE WHEN mode=? THEN status ELSE ? END,mode=? WHERE channel='amazon-us'", (configured_mode, configured_status, configured_mode))
         legacy = conn.execute(
             "SELECT t.*,p.asin FROM tickets t LEFT JOIN products p ON p.sku=t.sku WHERE t.external_event_id IS NULL AND COALESCE(t.is_archived,0)=0"
         ).fetchall()
@@ -896,6 +1035,16 @@ def init_db() -> None:
         for row in conn.execute("SELECT id,event_at,priority FROM tickets WHERE due_at IS NULL AND event_at IS NOT NULL"):
             conn.execute("UPDATE tickets SET due_at=? WHERE id=?", (ticket_due_at(row["event_at"], row["priority"]), row["id"]))
         conn.commit()
+
+
+def check_schema_ready(required_version: int = 21) -> None:
+    with closing(connect()) as conn:
+        try:
+            version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]
+        except sqlite3.Error as exc:
+            raise RuntimeError("数据库尚未初始化，请先执行迁移任务") from exc
+    if version != required_version:
+        raise RuntimeError(f"数据库版本不匹配：当前 {version}，应用要求 {required_version}")
 
 
 def audit_event_hash(previous_hash: str, action: str, entity_type: str, entity_id: int | None, detail: str, created_at: str, actor: str, request_id: str) -> str:
@@ -925,6 +1074,37 @@ def verify_audit_tail(conn: sqlite3.Connection, limit: int = 100) -> bool:
     return True
 
 
+def create_audit_checkpoint(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    event = conn.execute("SELECT id,event_hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+    if not event or not AUDIT_SIGNING_KEY:
+        return None
+    existing = conn.execute("SELECT * FROM audit_checkpoints WHERE last_event_id=?", (event["id"],)).fetchone()
+    if existing:
+        return dict(existing)
+    payload = f"{event['id']}:{event['event_hash']}"
+    signature = hmac.new(AUDIT_SIGNING_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    created_at = now()
+    checkpoint_id = conn.execute("INSERT INTO audit_checkpoints(last_event_id,event_hash,signature,created_at) VALUES(?,?,?,?)", (event["id"], event["event_hash"], signature, created_at)).lastrowid
+    if AUDIT_CHECKPOINT_PATH:
+        AUDIT_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = json.dumps({"last_event_id": event["id"], "event_hash": event["event_hash"], "signature": signature, "created_at": created_at}, separators=(",", ":"))
+        with AUDIT_CHECKPOINT_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(record + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return dict(conn.execute("SELECT * FROM audit_checkpoints WHERE id=?", (checkpoint_id,)).fetchone())
+
+
+def verify_latest_audit_checkpoint(conn: sqlite3.Connection) -> bool:
+    checkpoint = conn.execute("SELECT * FROM audit_checkpoints ORDER BY id DESC LIMIT 1").fetchone()
+    if not checkpoint:
+        return APP_ENV != "production"
+    event = conn.execute("SELECT event_hash FROM audit_events WHERE id=?", (checkpoint["last_event_id"],)).fetchone()
+    payload = f"{checkpoint['last_event_id']}:{checkpoint['event_hash']}"
+    expected = hmac.new(AUDIT_SIGNING_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return bool(event and hmac.compare_digest(event["event_hash"], checkpoint["event_hash"]) and hmac.compare_digest(expected, checkpoint["signature"]))
+
+
 def audit(conn: sqlite3.Connection, action: str, entity_type: str, entity_id: int | None, detail: Any) -> None:
     detail_json, created_at, actor, request_id = json.dumps(detail, ensure_ascii=False), now(), request_actor.get(), request_trace.get()
     previous = conn.execute("SELECT event_hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
@@ -938,6 +1118,25 @@ def audit(conn: sqlite3.Connection, action: str, entity_type: str, entity_id: in
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row else None
+
+
+def require_independent_approver(actor: str, *makers: str | None) -> None:
+    if actor in {maker for maker in makers if maker}:
+        raise HTTPException(409, "创建人或编辑人与批准人不能是同一账号")
+
+
+def refundable_balance_cents(conn: sqlite3.Connection, order_id: int, exclude_action_id: int | None = None) -> tuple[int, str]:
+    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        raise HTTPException(404, "关联订单不存在")
+    gross = order["item_total_cents"] + order["shipping_total_cents"] + order["tax_total_cents"] - order["promotion_total_cents"]
+    sql = "SELECT COALESCE(SUM(amount_cents),0) FROM service_actions WHERE order_id=? AND action_type='refund' AND status IN ('requested','approved','completed')"
+    values: list[Any] = [order_id]
+    if exclude_action_id is not None:
+        sql += " AND id<>?"
+        values.append(exclude_action_id)
+    reserved = conn.execute(sql, values).fetchone()[0]
+    return max(0, gross - order["refund_total_cents"] - reserved), order["currency"]
 
 
 def product_image_url(sku: str, image_path: str | None = None) -> str | None:
@@ -1047,13 +1246,14 @@ def product_economics(product: dict[str, Any], profile: dict[str, Any] | None = 
         actual_units = Decimal(str(product.get("actual_order_units", 0)))
         revenue = totals.get("principal", Decimal("0")) + totals.get("promotion", Decimal("0"))
         tax_collected = totals.get("tax", Decimal("0"))
-        product_cost = actual_units * unit_cost
+        product_cost = Decimal(int(product.get("actual_cogs_cents", 0))) / 100 if product.get("actual_cogs_cents") is not None else actual_units * unit_cost
         referral_fee = abs(totals.get("referral_fee", Decimal("0")))
         fba_fee = abs(totals.get("fba_fee", Decimal("0")))
         inbound_cost = abs(totals.get("inbound_cost", Decimal("0")))
         ad_spend = abs(totals.get("advertising", Decimal("0")))
         refund_loss = abs(totals.get("refund", Decimal("0")))
-        other = abs(totals.get("other", Decimal("0")))
+        configured_other = actual_units * Decimal(str((profile or {}).get("other_cost_per_unit", 0)))
+        other = abs(totals["other"]) if "other" in totals else configured_other
         net_profit = revenue - product_cost - referral_fee - fba_fee - inbound_cost - ad_spend - refund_loss - other
         return {
             "revenue": money(revenue), "product_cost": money(product_cost), "referral_fee": money(referral_fee),
@@ -1076,7 +1276,8 @@ def product_economics(product: dict[str, Any], profile: dict[str, Any] | None = 
     ad_spend = revenue * ad_rate
     refund_rate = max(Decimal("0.02"), Decimal("0.11") - Decimal(str(product["rating"])) * Decimal("0.018"))
     refund_loss = revenue * refund_rate * Decimal("0.45")
-    net_profit = revenue - units * unit_cost - referral_fee - fba_fee - inbound_cost - ad_spend - refund_loss
+    other = units * Decimal(str(profile.get("other_cost_per_unit", 0)))
+    net_profit = revenue - units * unit_cost - referral_fee - fba_fee - inbound_cost - ad_spend - refund_loss - other
     return {
         "revenue": money(revenue), "product_cost": money(units * unit_cost),
         "referral_fee": money(referral_fee), "fba_fee": money(fba_fee),
@@ -1103,54 +1304,6 @@ def build_today_tasks(products: list[dict[str, Any]], tickets: list[dict[str, An
     if pending_listings:
         tasks.append({"tone": "blue", "title": f"审核 {pending_listings} 条美国站英文文案", "impact": "发布前核对规格证据、商标与关键词", "href": "/listings"})
     return tasks[:8]
-
-
-def inventory_status(stock_units: int, daily_sales: float, lead_time_days: int, pipeline_units: int = 0, moq: int = 1) -> dict[str, Any]:
-    if daily_sales <= 0:
-        return {"days": None, "level": "unknown", "label": "缺少销量数据", "reorder_point": None, "reorder_qty": 0}
-    days = round(stock_units / daily_sales, 1)
-    if days <= lead_time_days:
-        level, label = "critical", "紧急补货"
-    elif days <= lead_time_days + 7:
-        level, label = "warning", "需要补货"
-    else:
-        level, label = "healthy", "库存健康"
-    raw_qty = max(0, math.ceil(daily_sales * (lead_time_days + 14) - stock_units - pipeline_units))
-    reorder_qty = math.ceil(raw_qty / max(1, moq)) * max(1, moq)
-    return {"days": days, "level": level, "label": label, "reorder_point": lead_time_days + 7, "reorder_qty": reorder_qty}
-
-
-def ticket_rules(rating: int, refund_requested: bool) -> dict[str, str]:
-    if rating <= 2 and refund_requested:
-        return {"priority": "P0", "topic": "after_sales", "sla": "2小时联系，24小时给方案，48小时闭环"}
-    if rating <= 2 or refund_requested:
-        return {"priority": "P1", "topic": "customer_risk", "sla": "24小时确认原因，72小时闭环"}
-    return {"priority": "P2", "topic": "feedback", "sla": "3个工作日内跟进"}
-
-
-def event_ticket_rules(event_type: str, rating: int, refund_requested: bool) -> dict[str, str]:
-    if event_type == "return_refund" and (refund_requested or rating <= 2):
-        return {"priority": "P0", "topic": "return_refund", "sla": "2小时核验订单，24小时给出处理方案"}
-    if event_type in {"order_exception", "buyer_cancel"} or rating <= 2:
-        return {"priority": "P1", "topic": event_type, "sla": "24小时核验并完成首次响应"}
-    return {"priority": "P2", "topic": "buyer_message", "sla": "2个工作日内人工回复"}
-
-
-def ticket_due_at(event_at: str, priority: str) -> str:
-    hours = {"P0": 2, "P1": 24, "P2": 48}.get(priority, 48)
-    return (datetime.fromisoformat(event_at.replace("Z", "+00:00")) + timedelta(hours=hours)).isoformat(timespec="seconds")
-
-
-def allocate_cents(total_cents: int, weights: list[int]) -> list[int]:
-    """按权重分摊整数美分，并把舍入余数归入最后一行。"""
-    denominator = sum(weights)
-    allocated: list[int] = []
-    used = 0
-    for index, weight in enumerate(weights):
-        share = total_cents - used if index == len(weights) - 1 else (total_cents * weight // denominator if denominator else 0)
-        allocated.append(share)
-        used += share
-    return allocated
 
 
 def load_demo_channel(name: str) -> list[dict[str, Any]]:
@@ -1185,10 +1338,23 @@ def load_demo_channel(name: str) -> list[dict[str, Any]]:
     raise FileNotFoundError(f"缺少演示渠道数据: {name}")
 
 
+def channel_adapter() -> DemoAmazonAdapter | HttpAmazonAdapter:
+    if CHANNEL_ADAPTER == "demo":
+        return DemoAmazonAdapter(load_demo_channel)
+    if CHANNEL_ADAPTER == "http":
+        base_url = os.getenv("AMAZON_ADAPTER_BASE_URL", "").strip()
+        token = os.getenv("AMAZON_ADAPTER_TOKEN", "").strip()
+        if not base_url or not token:
+            raise RuntimeError("HTTP 渠道适配器缺少 AMAZON_ADAPTER_BASE_URL 或 AMAZON_ADAPTER_TOKEN")
+        return HttpAmazonAdapter(base_url, token, float(os.getenv("AMAZON_ADAPTER_TIMEOUT_SECONDS", "30")))
+    raise RuntimeError("CHANNEL_ADAPTER 只能是 demo 或 http")
+
+
 def finish_sync(conn: sqlite3.Connection, sync_type: str, started_at: str, counts: dict[str, int], failures: list[dict[str, Any]]) -> dict[str, Any]:
     completed_at = now()
+    connection_mode = active_channel_mode.get()
     result = {
-        "sync_type": sync_type, "connection_mode": "demo_sp_api", "fetched": counts["fetched"],
+        "sync_type": sync_type, "connection_mode": connection_mode, "fetched": counts["fetched"],
         "inserted": counts["inserted"], "updated": counts["updated"], "skipped": counts["skipped"],
         "errors": counts["errors"], "completed_at": completed_at,
     }
@@ -1204,7 +1370,8 @@ def finish_sync(conn: sqlite3.Connection, sync_type: str, started_at: str, count
         )
     result["sync_run_id"] = run_id
     column = {"inventory": "last_inventory_sync_at", "tickets": "last_ticket_sync_at", "feedback": "last_feedback_sync_at", "orders": "last_order_sync_at", "finance": "last_finance_sync_at", "market": "last_market_sync_at"}[sync_type]
-    conn.execute(f"UPDATE channel_connections SET {column}=?,last_result=? WHERE channel='amazon-us'", (completed_at, json.dumps(result, ensure_ascii=False)))
+    connection_status = "connected_demo" if connection_mode == "demo_sp_api" else "connected"
+    conn.execute(f"UPDATE channel_connections SET {column}=?,mode=?,status=?,last_result=? WHERE channel='amazon-us'", (completed_at, connection_mode, connection_status, json.dumps(result, ensure_ascii=False)))
     audit(conn, f"{sync_type}_synced", sync_type, None, result)
     conn.commit()
     return result
@@ -1229,19 +1396,20 @@ def sync_order_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 amounts = [float(raw.get(key, 0)) for key in ("item_total", "shipping_total", "tax_total", "promotion_total", "refund_total")]
                 if min(amounts) < 0:
                     raise ValueError("订单金额不能为负数")
+                amount_cents = [money_to_cents(raw.get(key, 0)) for key in ("item_total", "shipping_total", "tax_total", "promotion_total", "refund_total")]
                 order_values = (
                     masked, status, str(raw.get("fulfillment_channel", "AFN")), str(raw["purchase_at"]),
                     raw.get("latest_ship_at"), raw.get("latest_delivery_at"), str(raw.get("currency", "USD")),
-                    *amounts, buyer_alias,
+                    *amounts, *amount_cents, buyer_alias,
                 )
                 existing = conn.execute("SELECT * FROM orders WHERE external_order_id=?", (external_id,)).fetchone()
-                comparable = ("order_id_masked", "status", "fulfillment_channel", "purchase_at", "latest_ship_at", "latest_delivery_at", "currency", "item_total", "shipping_total", "tax_total", "promotion_total", "refund_total", "buyer_alias")
+                comparable = ("order_id_masked", "status", "fulfillment_channel", "purchase_at", "latest_ship_at", "latest_delivery_at", "currency", "item_total", "shipping_total", "tax_total", "promotion_total", "refund_total", "item_total_cents", "shipping_total_cents", "tax_total_cents", "promotion_total_cents", "refund_total_cents", "buyer_alias")
                 same_order = bool(existing and tuple(existing[key] for key in comparable) == order_values)
                 timestamp = now()
                 if existing and not same_order:
                     conn.execute(
                         """UPDATE orders SET order_id_masked=?,status=?,fulfillment_channel=?,purchase_at=?,latest_ship_at=?,latest_delivery_at=?,currency=?,
-                        item_total=?,shipping_total=?,tax_total=?,promotion_total=?,refund_total=?,buyer_alias=?,synced_at=?,version=version+1 WHERE id=?""",
+                        item_total=?,shipping_total=?,tax_total=?,promotion_total=?,refund_total=?,item_total_cents=?,shipping_total_cents=?,tax_total_cents=?,promotion_total_cents=?,refund_total_cents=?,buyer_alias=?,synced_at=?,version=version+1 WHERE id=?""",
                         (*order_values, timestamp, existing["id"]),
                     )
                     order_id = existing["id"]
@@ -1250,27 +1418,27 @@ def sync_order_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 else:
                     order_id = conn.execute(
                         """INSERT INTO orders(external_order_id,order_id_masked,status,fulfillment_channel,purchase_at,latest_ship_at,latest_delivery_at,currency,
-                        item_total,shipping_total,tax_total,promotion_total,refund_total,buyer_alias,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        item_total,shipping_total,tax_total,promotion_total,refund_total,item_total_cents,shipping_total_cents,tax_total_cents,promotion_total_cents,refund_total_cents,buyer_alias,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (external_id, *order_values, timestamp),
                     ).lastrowid
                 item_changes = 0
                 for item in items:
                     sku = str(item["sku"]).strip()
-                    product = conn.execute("SELECT id,asin FROM products WHERE sku=?", (sku,)).fetchone()
+                    product = conn.execute("SELECT id,asin,cost FROM products WHERE sku=?", (sku,)).fetchone()
                     quantity = int(item["quantity"])
                     if not product or product["asin"] != str(item["asin"]) or quantity <= 0:
                         raise ValueError(f"订单商品 {sku} 无法匹配商品主数据")
-                    item_values = (order_id, product["id"], sku, product["asin"], quantity, float(item["item_price"]), float(item.get("item_tax", 0)), float(item.get("promotion_discount", 0)), str(item.get("item_status", status)))
+                    item_values = (order_id, product["id"], sku, product["asin"], quantity, float(item["item_price"]), float(item.get("item_tax", 0)), float(item.get("promotion_discount", 0)), str(item.get("item_status", status)), money_to_cents(item["item_price"]), money_to_cents(item.get("item_tax", 0)), money_to_cents(item.get("promotion_discount", 0)), money_to_cents(product["cost"]))
                     if min(item_values[4:8]) < 0:
                         raise ValueError("订单商品金额不能为负数")
                     before = conn.execute("SELECT * FROM order_items WHERE external_item_id=?", (str(item["external_item_id"]),)).fetchone()
-                    normalized = (order_id, product["id"], sku, product["asin"], quantity, float(item["item_price"]), float(item.get("item_tax", 0)), float(item.get("promotion_discount", 0)), str(item.get("item_status", status)))
-                    if not before or tuple(before[key] for key in ("order_id", "product_id", "sku", "asin", "quantity", "item_price", "item_tax", "promotion_discount", "item_status")) != normalized:
+                    comparable_item = ("order_id", "product_id", "sku", "asin", "quantity", "item_price", "item_tax", "promotion_discount", "item_status", "item_price_cents", "item_tax_cents", "promotion_discount_cents")
+                    if not before or tuple(before[key] for key in comparable_item) != item_values[:-1]:
                         item_changes += 1
                     conn.execute(
-                        """INSERT INTO order_items(order_id,external_item_id,product_id,sku,asin,quantity,item_price,item_tax,promotion_discount,item_status)
-                        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(external_item_id) DO UPDATE SET order_id=excluded.order_id,product_id=excluded.product_id,sku=excluded.sku,
-                        asin=excluded.asin,quantity=excluded.quantity,item_price=excluded.item_price,item_tax=excluded.item_tax,promotion_discount=excluded.promotion_discount,item_status=excluded.item_status""",
+                        """INSERT INTO order_items(order_id,external_item_id,product_id,sku,asin,quantity,item_price,item_tax,promotion_discount,item_status,item_price_cents,item_tax_cents,promotion_discount_cents,unit_cost_cents)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(external_item_id) DO UPDATE SET order_id=excluded.order_id,product_id=excluded.product_id,sku=excluded.sku,
+                        asin=excluded.asin,quantity=excluded.quantity,item_price=excluded.item_price,item_tax=excluded.item_tax,promotion_discount=excluded.promotion_discount,item_status=excluded.item_status,item_price_cents=excluded.item_price_cents,item_tax_cents=excluded.item_tax_cents,promotion_discount_cents=excluded.promotion_discount_cents""",
                         (order_id, str(item["external_item_id"]), *item_values[1:]),
                     )
                 for returned in raw.get("returns", []):
@@ -1279,13 +1447,13 @@ def sync_order_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                         raise ValueError("退货记录无法匹配订单商品")
                     return_values = (
                         order_id, item_row["id"], str(returned["sku"]), str(returned["reason_code"]), str(returned["reason_text"]),
-                        int(returned["quantity"]), float(returned.get("refund_amount", 0)), str(returned["status"]), returned.get("carrier"),
+                        int(returned["quantity"]), float(returned.get("refund_amount", 0)), money_to_cents(returned.get("refund_amount", 0)), str(returned["status"]), returned.get("carrier"),
                         returned.get("tracking_masked"), str(returned["requested_at"]), returned.get("received_at"), returned.get("refunded_at"), timestamp,
                     )
                     conn.execute(
-                        """INSERT INTO returns(external_return_id,order_id,order_item_id,sku,reason_code,reason_text,quantity,refund_amount,status,carrier,tracking_masked,requested_at,received_at,refunded_at,synced_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(external_return_id) DO UPDATE SET order_id=excluded.order_id,order_item_id=excluded.order_item_id,sku=excluded.sku,
-                        reason_code=excluded.reason_code,reason_text=excluded.reason_text,quantity=excluded.quantity,refund_amount=excluded.refund_amount,status=excluded.status,
+                        """INSERT INTO returns(external_return_id,order_id,order_item_id,sku,reason_code,reason_text,quantity,refund_amount,refund_amount_cents,status,carrier,tracking_masked,requested_at,received_at,refunded_at,synced_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(external_return_id) DO UPDATE SET order_id=excluded.order_id,order_item_id=excluded.order_item_id,sku=excluded.sku,
+                        reason_code=excluded.reason_code,reason_text=excluded.reason_text,quantity=excluded.quantity,refund_amount=excluded.refund_amount,refund_amount_cents=excluded.refund_amount_cents,status=excluded.status,
                         carrier=excluded.carrier,tracking_masked=excluded.tracking_masked,requested_at=excluded.requested_at,received_at=excluded.received_at,refunded_at=excluded.refunded_at,synced_at=excluded.synced_at""",
                         (str(returned["external_return_id"]), *return_values),
                     )
@@ -1350,7 +1518,7 @@ def sync_inventory_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 conn.execute("ROLLBACK TO SAVEPOINT sync_row")
                 conn.execute("RELEASE SAVEPOINT sync_row")
                 counts["errors"] += 1
-                failures.append({"external_event_id": raw.get("external_event_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": raw})
+                failures.append({"external_event_id": raw.get("external_event_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": sanitize_channel_payload(raw)})
         return finish_sync(conn, "inventory", started_at, counts, failures)
 
 
@@ -1434,7 +1602,7 @@ def sync_feedback_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 conn.execute("ROLLBACK TO SAVEPOINT sync_row")
                 conn.execute("RELEASE SAVEPOINT sync_row")
                 counts["errors"] += 1
-                failures.append({"external_event_id": raw.get("external_event_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": raw})
+                failures.append({"external_event_id": raw.get("external_event_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": sanitize_channel_payload(raw)})
         return finish_sync(conn, "feedback", started_at, counts, failures)
 
 
@@ -1473,7 +1641,7 @@ def sync_finance_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 conn.execute("ROLLBACK TO SAVEPOINT sync_row")
                 conn.execute("RELEASE SAVEPOINT sync_row")
                 counts["errors"] += 1
-                failures.append({"external_event_id": raw.get("external_transaction_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": raw})
+                failures.append({"external_event_id": raw.get("external_transaction_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": sanitize_channel_payload(raw)})
         return finish_sync(conn, "finance", started_at, counts, failures)
 
 
@@ -1504,7 +1672,7 @@ def sync_market_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 conn.execute("ROLLBACK TO SAVEPOINT sync_row")
                 conn.execute("RELEASE SAVEPOINT sync_row")
                 counts["errors"] += 1
-                failures.append({"external_event_id": raw.get("external_event_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": raw})
+                failures.append({"external_event_id": raw.get("external_event_id"), "sku": raw.get("sku"), "error_code": type(exc).__name__, "error_message": str(exc)[:500], "raw_payload": sanitize_channel_payload(raw)})
         return finish_sync(conn, "market", started_at, counts, failures)
 
 
@@ -1584,7 +1752,26 @@ def process_sync_job(job_id: int) -> dict[str, Any] | None:
             conn.execute("UPDATE jobs SET progress=25,current_step='校验并写入数据',heartbeat_at=? WHERE id=?", (now(), job_id))
             conn.commit()
         runners = {"orders": sync_order_rows, "inventory": sync_inventory_rows, "tickets": sync_ticket_rows, "feedback": sync_feedback_rows, "finance": sync_finance_rows, "market": sync_market_rows}
-        result = runners[sync_type](load_demo_channel(sync_type))
+        adapter = channel_adapter()
+        mode_token = active_channel_mode.set(adapter.mode)
+        try:
+            with closing(connect()) as conn:
+                cursor_row = conn.execute("SELECT cursor,watermark FROM channel_sync_cursors WHERE channel='amazon-us' AND sync_type=?", (sync_type,)).fetchone()
+            cursor = (cursor_row["cursor"] or cursor_row["watermark"]) if cursor_row else None
+            result = {"sync_type": sync_type, "connection_mode": adapter.mode, "fetched": 0, "inserted": 0, "updated": 0, "skipped": 0, "errors": 0, "sync_run_ids": []}
+            for rows, next_cursor, watermark in adapter.iter_pages(sync_type, cursor):
+                page_result = runners[sync_type](rows)
+                for key in ("fetched", "inserted", "updated", "skipped", "errors"):
+                    result[key] += page_result[key]
+                result["sync_run_ids"].append(page_result["sync_run_id"])
+                checkpoint = next_cursor or watermark
+                with closing(connect()) as conn:
+                    conn.execute("INSERT INTO channel_sync_cursors(channel,sync_type,cursor,watermark,updated_at) VALUES('amazon-us',?,?,?,?) ON CONFLICT(channel,sync_type) DO UPDATE SET cursor=excluded.cursor,watermark=COALESCE(excluded.watermark,channel_sync_cursors.watermark),updated_at=excluded.updated_at", (sync_type, checkpoint, watermark, now()))
+                    conn.commit()
+            result["sync_run_id"] = result["sync_run_ids"][-1] if result["sync_run_ids"] else None
+            result["completed_at"] = now()
+        finally:
+            active_channel_mode.reset(mode_token)
         with closing(connect()) as conn:
             conn.execute("UPDATE jobs SET status='succeeded',completed_at=?,last_error=NULL,progress=100,current_step='同步完成',result=?,heartbeat_at=? WHERE id=?", (now(), json.dumps(result, ensure_ascii=False), now(), job_id))
             audit(conn, "sync_job_succeeded", "job", job_id, {"sync_type": sync_type, "sync_run_id": result["sync_run_id"]})
@@ -1629,14 +1816,20 @@ def parse_bool(value: str) -> bool:
 
 
 def sanitize_channel_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    safe = dict(raw)
-    if "customer_alias" in safe:
-        safe["customer_alias"] = "[REDACTED]"
-    if "order_id_masked" in safe:
-        safe["order_id_masked"] = "[REDACTED]"
-    if "message" in safe:
-        safe["message"] = redact_customer_data({"message": safe["message"]})["message"]
-    return safe
+    sensitive_keys = {"customer_alias", "buyer_alias", "order_id_masked", "external_order_id", "email", "phone", "address", "name"}
+
+    def clean(value: Any, key: str = "") -> Any:
+        if key.lower() in sensitive_keys:
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {child_key: clean(child, child_key) for child_key, child in value.items()}
+        if isinstance(value, list):
+            return [clean(child) for child in value]
+        if isinstance(value, str):
+            return redact_customer_data({"message": value})["message"]
+        return value
+
+    return clean(raw)
 
 
 def read_csv(upload: UploadFile, content: bytes) -> list[dict[str, str]]:
@@ -1938,6 +2131,12 @@ def refresh_notifications(conn: sqlite3.Connection) -> None:
         active.append((f"ticket-overdue:{row['id']}", "客服", "critical", f"工单 {row['order_id_masked']} 已超过 SLA", "/tickets"))
     for row in conn.execute("SELECT id,job_type FROM jobs WHERE status='failed'"):
         active.append((f"job-failed:{row['id']}", "同步", "critical", f"渠道任务 #{row['id']} 执行失败", "/dashboard"))
+    latest_backup = conn.execute("SELECT id,status,error FROM backup_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if latest_backup and latest_backup["status"] == "failed":
+        active.append((f"backup-failed:{latest_backup['id']}", "备份", "critical", "数据库备份失败，请检查副本存储和磁盘空间", "/dashboard"))
+    open_failures = conn.execute("SELECT COUNT(*) FROM sync_failures WHERE status='open'").fetchone()[0]
+    if open_failures:
+        active.append(("sync-failures-open", "同步", "warning", f"有 {open_failures} 条渠道数据异常待处理", "/sync-failures"))
     for row in conn.execute("SELECT id,sku,due_at FROM feedback_actions WHERE status!='resolved' AND due_at<?", (timestamp,)):
         active.append((f"feedback-overdue:{row['id']}", "反馈", "warning", f"{row['sku']} 反馈改进行动已逾期", "/feedback"))
     for row in conn.execute("SELECT sku,fulfillable,daily_sales,lead_time_days FROM inventory_snapshots WHERE daily_sales>0 AND fulfillable/daily_sales<=lead_time_days"):
@@ -1953,22 +2152,128 @@ def refresh_notifications(conn: sqlite3.Connection) -> None:
             "INSERT INTO operational_notifications(fingerprint,category,severity,title,href,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,'unread',?,?) ON CONFLICT(fingerprint) DO UPDATE SET category=excluded.category,severity=excluded.severity,title=excluded.title,href=excluded.href,last_seen_at=excluded.last_seen_at,status=CASE WHEN operational_notifications.status='resolved' THEN 'unread' ELSE operational_notifications.status END",
             (fingerprint, category, severity, title, href, timestamp, timestamp),
         )
+        if ALERT_WEBHOOK_URL:
+            notification_id = conn.execute("SELECT id FROM operational_notifications WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
+            conn.execute("INSERT OR IGNORE INTO notification_deliveries(notification_id,channel,status,created_at) VALUES(?,'webhook','pending',?)", (notification_id, timestamp))
+
+
+def dispatch_notification_deliveries() -> dict[str, int]:
+    counts = {"sent": 0, "failed": 0}
+    if not ALERT_WEBHOOK_URL:
+        return counts
+    claimed: list[dict[str, Any]] = []
+    claim_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    with closing(connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        deliveries = conn.execute("SELECT d.*,n.category,n.severity,n.title,n.href FROM notification_deliveries d JOIN operational_notifications n ON n.id=d.notification_id WHERE d.status IN ('pending','failed') AND d.attempts<5 AND (d.next_attempt_at IS NULL OR d.next_attempt_at<=?) AND (d.claimed_at IS NULL OR d.claimed_at<=?) ORDER BY d.id LIMIT 20", (now(), claim_cutoff)).fetchall()
+        for delivery in deliveries:
+            claim_token = uuid.uuid4().hex
+            if conn.execute("UPDATE notification_deliveries SET claim_token=?,claimed_at=? WHERE id=? AND (claimed_at IS NULL OR claimed_at<=?)", (claim_token, now(), delivery["id"], claim_cutoff)).rowcount:
+                claimed.append({**dict(delivery), "claim_token": claim_token})
+        conn.commit()
+    for delivery in claimed:
+        payload = json.dumps({"delivery_id": delivery["id"], "category": delivery["category"], "severity": delivery["severity"], "title": delivery["title"], "href": delivery["href"]}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Idempotency-Key": f"alert-{delivery['id']}"}
+        if ALERT_WEBHOOK_SIGNING_KEY:
+            headers["X-Webhook-Signature"] = hmac.new(ALERT_WEBHOOK_SIGNING_KEY.encode(), payload, hashlib.sha256).hexdigest()
+        try:
+            response = httpx.post(ALERT_WEBHOOK_URL, content=payload, headers=headers, timeout=10)
+            response.raise_for_status()
+            with closing(connect()) as conn:
+                conn.execute("UPDATE notification_deliveries SET status='sent',attempts=attempts+1,last_error=NULL,sent_at=?,next_attempt_at=NULL,response_code=?,claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?", (now(), response.status_code, delivery["id"], delivery["claim_token"]))
+                conn.commit()
+            counts["sent"] += 1
+        except httpx.HTTPError as exc:
+            delay_minutes = min(60, 2 ** (delivery["attempts"] + 1))
+            next_attempt = (datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)).isoformat(timespec="seconds")
+            response_code = getattr(getattr(exc, "response", None), "status_code", None)
+            with closing(connect()) as conn:
+                conn.execute("UPDATE notification_deliveries SET status='failed',attempts=attempts+1,last_error=?,next_attempt_at=?,response_code=?,claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?", (str(exc)[:500], next_attempt, response_code, delivery["id"], delivery["claim_token"]))
+                conn.commit()
+            counts["failed"] += 1
+    return counts
+
+
+def privacy_subject_ref(value: str) -> str:
+    return hmac.new(PRIVACY_HASH_KEY.encode(), value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def purge_ticket_attachments(conn: sqlite3.Connection, ticket_ids: list[int], reason: str) -> int:
+    if not ticket_ids:
+        return 0
+    placeholders = ",".join("?" for _ in ticket_ids)
+    rows = conn.execute(f"SELECT id,stored_name FROM ticket_attachments WHERE ticket_id IN ({placeholders}) AND deleted_at IS NULL", ticket_ids).fetchall()
+    timestamp = now()
+    for row in rows:
+        target = (PRIVATE_ROOT / row["stored_name"]).resolve()
+        if target.is_relative_to(PRIVATE_ROOT):
+            target.unlink(missing_ok=True)
+        conn.execute("UPDATE ticket_attachments SET deleted_at=?,original_name='[已删除]',sha256='',scan_status='quarantined' WHERE id=?", (timestamp, row["id"]))
+    if rows:
+        audit(conn, "ticket_attachments_purged", "ticket", None, {"count": len(rows), "reason": reason})
+    return len(rows)
+
+
+def cleanup_expired_attachments(conn: sqlite3.Connection) -> int:
+    ticket_ids = [row["ticket_id"] for row in conn.execute("SELECT DISTINCT ticket_id FROM ticket_attachments WHERE deleted_at IS NULL AND expires_at IS NOT NULL AND expires_at<=?", (now(),))]
+    return purge_ticket_attachments(conn, ticket_ids, "retention_expired")
+
+
+def apply_data_retention(conn: sqlite3.Connection) -> dict[str, int]:
+    failure_cutoff = (datetime.now(timezone.utc) - timedelta(days=SYNC_FAILURE_RETENTION_DAYS)).isoformat(timespec="seconds")
+    customer_cutoff = (datetime.now(timezone.utc) - timedelta(days=CUSTOMER_RETENTION_DAYS)).isoformat(timespec="seconds")
+    deleted_failures = conn.execute("DELETE FROM sync_failures WHERE created_at<?", (failure_cutoff,)).rowcount
+    ticket_ids = [row["id"] for row in conn.execute("SELECT id FROM tickets t WHERE t.event_at<? AND t.status IN ('resolved','closed') AND NOT EXISTS(SELECT 1 FROM legal_holds h WHERE h.entity_type='customer_alias' AND h.entity_key=t.customer_alias AND h.active=1)", (customer_cutoff,))]
+    purged_attachments = purge_ticket_attachments(conn, ticket_ids, "customer_retention")
+    for ticket_id in ticket_ids:
+        conn.execute("UPDATE ticket_messages SET body='[已按保留策略匿名化]',action_plan='[已按保留策略匿名化]' WHERE ticket_id=?", (ticket_id,))
+        conn.execute("UPDATE ticket_events SET body='[已按保留策略匿名化]',metadata='{}' WHERE ticket_id=?", (ticket_id,))
+        conn.execute("UPDATE tickets SET customer_alias='已匿名客户',message='[已按保留策略匿名化]',conversation='[]',reply_draft=NULL,action_plan=NULL WHERE id=?", (ticket_id,))
+    anonymized_orders = conn.execute("UPDATE orders SET buyer_alias='已匿名客户' WHERE purchase_at<? AND buyer_alias<>'已匿名客户' AND NOT EXISTS(SELECT 1 FROM legal_holds h WHERE h.entity_type='customer_alias' AND h.entity_key=orders.buyer_alias AND h.active=1)", (customer_cutoff,)).rowcount
+    return {"deleted_sync_failures": deleted_failures, "anonymized_tickets": len(ticket_ids), "anonymized_orders": anonymized_orders, "purged_attachments": purged_attachments}
+
+
+def run_operational_maintenance() -> dict[str, Any]:
+    token = request_actor.set("system:maintenance")
+    try:
+        with closing(connect()) as conn:
+            refresh_notifications(conn)
+            retention = apply_data_retention(conn)
+            retention["expired_attachments"] = cleanup_expired_attachments(conn)
+            checkpoint = create_audit_checkpoint(conn)
+            conn.commit()
+        deliveries = dispatch_notification_deliveries()
+        backup_result = ensure_recent_backup()
+        return {"notifications": deliveries, "retention": retention, "audit_checkpoint": checkpoint["last_event_id"] if checkpoint else None, "backup": backup_result}
+    finally:
+        request_actor.reset(token)
+
+
+def ensure_recent_backup() -> dict[str, Any]:
+    with closing(connect()) as conn:
+        latest = conn.execute("SELECT completed_at FROM backup_runs WHERE status='success' ORDER BY completed_at DESC LIMIT 1").fetchone()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+    if latest and latest["completed_at"] >= cutoff:
+        return {"status": "fresh", "completed_at": latest["completed_at"]}
+    from scripts.backup_db import backup
+    target = backup(db_path(), BACKUP_ROOT, retention=14, replica_dir=BACKUP_REPLICA_PATH)
+    return {"status": "created", "path": str(target)}
 
 
 def page_context(page: str, params: dict[str, str] | None = None, current_user: dict[str, Any] | None = None) -> dict[str, Any]:
     params = params or {}
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(BUSINESS_TIMEZONE).date()
     date_from = params.get("date_from", (today - timedelta(days=29)).isoformat()).strip()
     date_to = params.get("date_to", today.isoformat()).strip()
     try:
-        period_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        period_end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        period_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=BUSINESS_TIMEZONE).astimezone(timezone.utc)
+        period_end = (datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=BUSINESS_TIMEZONE) + timedelta(days=1)).astimezone(timezone.utc)
         if period_start >= period_end:
             raise ValueError
     except ValueError:
         date_from, date_to = (today - timedelta(days=29)).isoformat(), today.isoformat()
-        period_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        period_end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        period_start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=BUSINESS_TIMEZONE).astimezone(timezone.utc)
+        period_end = (datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=BUSINESS_TIMEZONE) + timedelta(days=1)).astimezone(timezone.utc)
     period_values = (period_start.isoformat(timespec="seconds"), period_end.isoformat(timespec="seconds"))
     q = params.get("q", "").strip()
     category_filter = params.get("category", "").strip()
@@ -1977,6 +2282,7 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
     order_status = params.get("order_status", "").strip()
     ticket_status = params.get("ticket_status", "").strip()
     ticket_priority = params.get("ticket_priority", "").strip()
+    failure_status = params.get("failure_status", "open").strip()
     try:
         page_no = max(1, int(params.get("page_no", "1")))
     except ValueError:
@@ -1991,9 +2297,10 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
         connection = row_dict(conn.execute("SELECT * FROM channel_connections WHERE channel='amazon-us'").fetchone()) or {}
         for key in ("last_inventory_sync_at", "last_ticket_sync_at", "last_feedback_sync_at", "last_order_sync_at", "last_finance_sync_at", "last_market_sync_at"):
             connection[f"{key}_display"] = display_time(connection.get(key))
-        snapshot_by_sku = {row["sku"]: dict(row) for row in conn.execute("SELECT * FROM inventory_snapshots ORDER BY synced_at")}
-        warehouse_by_sku = {row["sku"]: dict(row) for row in conn.execute("SELECT * FROM warehouse_inventory")}
-        open_po_by_sku = {row["sku"]: row["remaining"] for row in conn.execute("SELECT poi.sku,SUM(poi.ordered_qty-poi.received_qty-poi.rejected_qty) remaining FROM purchase_order_items poi JOIN purchase_orders po ON po.id=poi.purchase_order_id WHERE po.status IN ('draft','approved','sent_demo','partially_received') GROUP BY poi.sku")}
+        product_pages = {"dashboard", "products", "profit", "inventory", "procurement", "tickets", "feedback"}
+        snapshot_by_sku = {row["sku"]: dict(row) for row in conn.execute("SELECT * FROM inventory_snapshots ORDER BY synced_at")} if page in product_pages else {}
+        warehouse_by_sku = {row["sku"]: dict(row) for row in conn.execute("SELECT * FROM warehouse_inventory")} if page in {"dashboard", "inventory", "procurement"} else {}
+        open_po_by_sku = {row["sku"]: row["remaining"] for row in conn.execute("SELECT poi.sku,SUM(poi.ordered_qty-poi.received_qty-poi.rejected_qty) remaining FROM purchase_order_items poi JOIN purchase_orders po ON po.id=poi.purchase_order_id WHERE po.status IN ('approved','sent_demo','partially_received') GROUP BY poi.sku")} if page in {"dashboard", "inventory", "procurement"} else {}
         if page == "products":
             clauses, values = [], []
             if q:
@@ -2007,20 +2314,27 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             sql_page_total = conn.execute(f"SELECT COUNT(*) FROM products{where}", values).fetchone()[0]
             total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
             products = [dict(row) for row in conn.execute(f"SELECT * FROM products{where} ORDER BY id DESC LIMIT ? OFFSET ?", (*values, page_size, offset))]
-        else:
+        elif page == "inventory":
+            sql_page_total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+            total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
+            products = [dict(row) for row in conn.execute("SELECT * FROM products ORDER BY id DESC LIMIT ? OFFSET ?", (page_size, offset))]
+        elif page in product_pages:
             products = [dict(row) for row in conn.execute("SELECT * FROM products ORDER BY id DESC")]
-        cost_profiles = {row["product_id"]: dict(row) for row in conn.execute("SELECT * FROM cost_profiles")}
+        else:
+            products = []
+        cost_profiles = {row["product_id"]: dict(row) for row in conn.execute("SELECT * FROM cost_profiles")} if page in {"dashboard", "profit"} else {}
         financial_by_sku: dict[str, list[dict[str, Any]]] = {}
-        for row in conn.execute("SELECT * FROM financial_transactions WHERE posted_at>=? AND posted_at<? ORDER BY posted_at", period_values):
+        for row in conn.execute("SELECT * FROM financial_transactions WHERE posted_at>=? AND posted_at<? ORDER BY posted_at", period_values) if page in {"dashboard", "profit"} else []:
             financial_by_sku.setdefault(row["sku"], []).append(dict(row))
-        actual_units = {row["sku"]: row["units"] for row in conn.execute("SELECT oi.sku,SUM(oi.quantity) AS units FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.item_status!='cancelled' AND o.purchase_at>=? AND o.purchase_at<? GROUP BY oi.sku", period_values)}
-        market_by_sku = {row["sku"]: dict(row) for row in conn.execute("SELECT m.* FROM market_research_snapshots m JOIN (SELECT sku,MAX(captured_at) captured_at FROM market_research_snapshots GROUP BY sku) latest ON latest.sku=m.sku AND latest.captured_at=m.captured_at")}
+        actual_units = {row["sku"]: row["units"] for row in conn.execute("SELECT oi.sku,SUM(oi.quantity) AS units FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.item_status!='cancelled' AND o.purchase_at>=? AND o.purchase_at<? GROUP BY oi.sku", period_values)} if page in {"dashboard", "profit"} else {}
+        actual_cogs = {row["sku"]: row["cogs_cents"] for row in conn.execute("SELECT oi.sku,SUM(oi.quantity*oi.unit_cost_cents) AS cogs_cents FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.item_status!='cancelled' AND o.purchase_at>=? AND o.purchase_at<? GROUP BY oi.sku", period_values)} if page in {"dashboard", "profit"} else {}
+        market_by_sku = {row["sku"]: dict(row) for row in conn.execute("SELECT m.* FROM market_research_snapshots m JOIN (SELECT sku,MAX(captured_at) captured_at FROM market_research_snapshots GROUP BY sku) latest ON latest.sku=m.sku AND latest.captured_at=m.captured_at")} if page in {"dashboard", "products", "profit"} else {}
         inventory_trends: dict[str, list[dict[str, Any]]] = {}
-        for row in conn.execute("SELECT sku,fulfillable,reserved,inbound,unfulfillable,daily_sales,observed_at FROM inventory_history ORDER BY observed_at DESC,id DESC"):
+        for row in conn.execute("SELECT sku,fulfillable,reserved,inbound,unfulfillable,daily_sales,observed_at FROM inventory_history ORDER BY observed_at DESC,id DESC") if page == "inventory" else []:
             if len(inventory_trends.setdefault(row["sku"], [])) < 12:
                 inventory_trends[row["sku"]].append(dict(row))
         evidence_by_product: dict[int, list[dict[str, Any]]] = {}
-        for row in conn.execute("SELECT * FROM product_evidence ORDER BY id DESC"):
+        for row in conn.execute("SELECT * FROM product_evidence ORDER BY id DESC") if page == "products" else []:
             evidence_by_product.setdefault(row["product_id"], []).append(dict(row))
         categories = [row[0] for row in conn.execute("SELECT DISTINCT category FROM products ORDER BY category")]
         for product in products:
@@ -2041,6 +2355,7 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             pipeline_units = int(product["inbound"] + product["warehouse_on_hand"] + product["open_po_units"])
             product["inventory"] = inventory_status(product["fulfillable"], product["daily_sales"], product["lead_time_days"], pipeline_units, product.get("moq", 1))
             product["actual_order_units"] = actual_units.get(product["sku"], 0)
+            product["actual_cogs_cents"] = actual_cogs.get(product["sku"])
             product["economics"] = product_economics(product, cost_profiles.get(product["id"]), financial_by_sku.get(product["sku"]))
             product["cost_profile"] = cost_profiles.get(product["id"], {})
             product["market_signal"] = market_by_sku.get(product["sku"])
@@ -2048,18 +2363,22 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             product["evidence"] = evidence_by_product.get(product["id"], [])
             product["verified_evidence_count"] = sum(item["status"] == "verified" for item in product["evidence"])
             product["score_breakdown"] = json.loads(product["score_breakdown"]) if product["score_breakdown"] else None
-        replenishment_plans = [dict(row) for row in conn.execute("SELECT rp.*,p.source_title,p.image_path FROM replenishment_plans rp JOIN products p ON p.id=rp.product_id ORDER BY rp.id DESC")]
+        replenishment_plans = [dict(row) for row in conn.execute("SELECT rp.*,p.source_title,p.image_path FROM replenishment_plans rp JOIN products p ON p.id=rp.product_id ORDER BY rp.id DESC LIMIT 100")] if page == "procurement" else []
         for plan in replenishment_plans:
             plan["image_url"] = product_image_url(plan["sku"], plan.get("image_path"))
-        purchase_orders = [dict(row) for row in conn.execute("SELECT po.*,s.name AS supplier_name,s.payment_terms FROM purchase_orders po JOIN suppliers s ON s.id=po.supplier_id ORDER BY po.id DESC")]
+        purchase_orders = [dict(row) for row in conn.execute("SELECT po.*,s.name AS supplier_name,s.payment_terms FROM purchase_orders po JOIN suppliers s ON s.id=po.supplier_id ORDER BY po.id DESC LIMIT 100")] if page == "procurement" else []
         po_items: dict[int, list[dict[str, Any]]] = {}
-        for row in conn.execute("SELECT poi.*,p.source_title,p.image_path FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id ORDER BY poi.id"):
+        for row in conn.execute("SELECT poi.*,p.source_title,p.image_path FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id ORDER BY poi.id") if page == "procurement" else []:
             item = dict(row)
             item["image_url"] = product_image_url(item["sku"], item.get("image_path"))
             po_items.setdefault(item["purchase_order_id"], []).append(item)
         for purchase_order in purchase_orders:
             purchase_order["items"] = po_items.get(purchase_order["id"], [])
             purchase_order["expected_at_display"] = display_time(purchase_order.get("expected_at"))
+        po_cancellations = [dict(row) for row in conn.execute("SELECT * FROM purchase_order_cancellations ORDER BY id DESC LIMIT 100")] if page == "procurement" else []
+        cancellation_by_po = {row["purchase_order_id"]: row for row in po_cancellations}
+        for purchase_order in purchase_orders:
+            purchase_order["cancellation"] = cancellation_by_po.get(purchase_order["id"])
         listing_sql = "SELECT l.*,p.sku,p.asin,p.source_title,p.image_path FROM listings l JOIN products p ON p.id=l.product_id JOIN (SELECT product_id,MAX(id) AS latest_id FROM listings GROUP BY product_id) latest ON latest.latest_id=l.id"
         if page == "listings":
             clauses, values = [], []
@@ -2072,7 +2391,7 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
             listings = [dict(row) for row in conn.execute(f"{listing_sql}{where} ORDER BY l.id DESC LIMIT ? OFFSET ?", (*values, page_size, offset))]
         else:
-            listings = [dict(row) for row in conn.execute(f"{listing_sql} ORDER BY l.id DESC")]
+            listings = []
         for item in listings:
             item["image_url"] = product_image_url(item["sku"], item.get("image_path"))
             item["bullet_points"] = json.loads(item["bullet_points"])
@@ -2092,8 +2411,10 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             sql_page_total = conn.execute(f"SELECT COUNT(*) FROM orders o{where}", values).fetchone()[0]
             total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
             orders = [dict(row) for row in conn.execute(f"SELECT o.* FROM orders o{where} ORDER BY o.purchase_at DESC,o.id DESC LIMIT ? OFFSET ?", (*values, page_size, offset))]
-        else:
+        elif page == "tickets":
             orders = [dict(row) for row in conn.execute("SELECT * FROM orders ORDER BY purchase_at DESC,id DESC")]
+        else:
+            orders = []
         order_ids = [order["id"] for order in orders]
         order_items: dict[int, list[dict[str, Any]]] = {}
         child_where = f" WHERE oi.order_id IN ({','.join('?' * len(order_ids))})" if order_ids else " WHERE 0"
@@ -2122,8 +2443,10 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             sql_page_total = conn.execute(f"SELECT COUNT(*) FROM tickets{where}", ticket_values).fetchone()[0]
             total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
             tickets = [dict(row) for row in conn.execute(f"SELECT * FROM tickets{where} ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 ELSE 2 END,event_at DESC,id DESC LIMIT ? OFFSET ?", (*ticket_values, page_size, offset))]
-        else:
+        elif page == "dashboard":
             tickets = [dict(row) for row in conn.execute("SELECT * FROM tickets WHERE COALESCE(is_archived,0)=0 ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 ELSE 2 END,event_at DESC,id DESC")]
+        else:
+            tickets = []
         ticket_ids = [ticket["id"] for ticket in tickets]
         ticket_events: dict[int, list[dict[str, Any]]] = {}
         ticket_child_where = f" WHERE ticket_id IN ({','.join('?' * len(ticket_ids))})" if ticket_ids else " WHERE 0"
@@ -2132,6 +2455,14 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
         service_actions: dict[int, list[dict[str, Any]]] = {}
         for row in conn.execute(f"SELECT * FROM service_actions{ticket_child_where} ORDER BY id DESC", ticket_ids):
             service_actions.setdefault(row["ticket_id"], []).append(dict(row))
+        action_ids = [action["id"] for values in service_actions.values() for action in values]
+        action_reversals = {}
+        if page == "tickets" and action_ids:
+            placeholders = ",".join("?" * len(action_ids))
+            action_reversals = {row["service_action_id"]: dict(row) for row in conn.execute(f"SELECT * FROM service_action_reversals WHERE service_action_id IN ({placeholders})", action_ids)}
+        for values in service_actions.values():
+            for action in values:
+                action["reversal"] = action_reversals.get(action["id"])
         order_by_id = {order["id"]: order for order in orders}
         return_by_id = {returned["id"]: returned for values in returns_by_order.values() for returned in values}
         product_by_sku = {product["sku"]: product for product in products}
@@ -2153,18 +2484,24 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             ticket["events"] = ticket_events.get(ticket["id"], [])
             ticket["service_actions"] = service_actions.get(ticket["id"], [])
         message_map: dict[int, dict[str, Any]] = {}
-        for row in conn.execute("SELECT tm.* FROM ticket_messages tm JOIN (SELECT ticket_id,MAX(id) latest_id FROM ticket_messages GROUP BY ticket_id) latest ON latest.latest_id=tm.id"):
+        for row in conn.execute("SELECT tm.* FROM ticket_messages tm JOIN (SELECT ticket_id,MAX(id) latest_id FROM ticket_messages GROUP BY ticket_id) latest ON latest.latest_id=tm.id") if page == "tickets" else []:
             message_map[row["ticket_id"]] = dict(row)
         for ticket in tickets:
             ticket["reply_message"] = message_map.get(ticket["id"])
+        inventory_adjustments = [dict(row) for row in conn.execute("SELECT * FROM inventory_adjustments ORDER BY id DESC LIMIT 100")] if page == "inventory" else []
         attachment_map: dict[int, list[dict[str, Any]]] = {}
-        for row in conn.execute("SELECT id,ticket_id,original_name,content_type,size_bytes,uploaded_by,created_at,expires_at FROM ticket_attachments WHERE deleted_at IS NULL AND scan_status='clean' ORDER BY id DESC"):
+        for row in conn.execute("SELECT id,ticket_id,original_name,content_type,size_bytes,uploaded_by,created_at,expires_at FROM ticket_attachments WHERE deleted_at IS NULL AND scan_status='clean' ORDER BY id DESC") if page == "tickets" else []:
             attachment_map.setdefault(row["ticket_id"], []).append(dict(row))
         for ticket in tickets:
             ticket["private_attachments"] = attachment_map.get(ticket["id"], [])
-        feedback = [dict(row) for row in conn.execute("SELECT * FROM feedback_insights ORDER BY period DESC,mention_count DESC")]
+        if page == "feedback":
+            sql_page_total = conn.execute("SELECT COUNT(*) FROM feedback_insights").fetchone()[0]
+            total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
+            feedback = [dict(row) for row in conn.execute("SELECT * FROM feedback_insights ORDER BY period DESC,mention_count DESC LIMIT ? OFFSET ?", (page_size, offset))]
+        else:
+            feedback = []
         feedback_action_map: dict[str, list[dict[str, Any]]] = {}
-        for row in conn.execute("SELECT * FROM feedback_actions ORDER BY id DESC"):
+        for row in conn.execute("SELECT * FROM feedback_actions ORDER BY id DESC") if page == "feedback" else []:
             feedback_action_map.setdefault(row["feedback_event_id"], []).append(dict(row))
         for item in feedback:
             item["image_url"] = product_by_sku.get(item["sku"], {}).get("image_url")
@@ -2175,13 +2512,20 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             total_pages_sql = max(1, math.ceil(sql_page_total / page_size)); page_no = min(page_no, total_pages_sql); offset = (page_no - 1) * page_size
             audits = [dict(row) for row in conn.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ? OFFSET ?", (page_size, offset))]
         else:
-            audits = [dict(row) for row in conn.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 20")]
-        jobs = [dict(row) for row in conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 20")]
-        notifications = [dict(row) for row in conn.execute("SELECT * FROM operational_notifications WHERE status IN ('unread','read') ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,last_seen_at DESC LIMIT 20")]
-        ai_usage = row_dict(conn.execute("SELECT COUNT(*) run_count,COALESCE(SUM(input_tokens),0) input_tokens,COALESCE(SUM(output_tokens),0) output_tokens,COALESCE(SUM(estimated_cost_usd),0) estimated_cost_usd,COALESCE(AVG(latency_ms),0) avg_latency_ms FROM ai_runs").fetchone()) or {}
-        users = [dict(row) for row in conn.execute("SELECT username,role,is_active,must_change_password,mfa_enabled,created_at,last_login_at FROM users ORDER BY username")]
-        sessions = [dict(row) for row in conn.execute("SELECT session_id,username,created_at,expires_at,last_seen_at,revoked_at,user_agent,ip_masked FROM user_sessions WHERE username=? ORDER BY created_at DESC LIMIT 20", ((current_user or {}).get("sub", ""),))]
-        account = row_dict(conn.execute("SELECT username,role,must_change_password,mfa_secret,mfa_enabled,password_changed_at,last_login_at FROM users WHERE username=?", ((current_user or {}).get("sub", ""),)).fetchone())
+            audits = []
+        jobs = [dict(row) for row in conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 20")] if page == "dashboard" else []
+        notifications = [dict(row) for row in conn.execute("SELECT * FROM operational_notifications WHERE status IN ('unread','read') ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,last_seen_at DESC LIMIT 20")] if page == "dashboard" else []
+        ai_usage = (row_dict(conn.execute("SELECT COUNT(*) run_count,COALESCE(SUM(input_tokens),0) input_tokens,COALESCE(SUM(output_tokens),0) output_tokens,COALESCE(SUM(estimated_cost_usd),0) estimated_cost_usd,COALESCE(AVG(latency_ms),0) avg_latency_ms FROM ai_runs").fetchone()) or {}) if page in {"settings", "listings"} else {}
+        users = [dict(row) for row in conn.execute("SELECT username,role,is_active,must_change_password,mfa_enabled,created_at,last_login_at FROM users ORDER BY username")] if page == "settings" else []
+        permissions = {row["permission"] for row in conn.execute("SELECT permission FROM role_permissions WHERE role=?", ((current_user or {}).get("role", "viewer"),))}
+        failure_where, failure_values = "", []
+        if page == "sync-failures" and failure_status in {"open", "retrying", "resolved"}:
+            failure_where, failure_values = " WHERE sf.status=?", [failure_status]
+        sync_failures = [dict(row) for row in conn.execute(f"SELECT sf.*,sr.sync_type FROM sync_failures sf JOIN sync_runs sr ON sr.id=sf.sync_run_id{failure_where} ORDER BY sf.id DESC LIMIT 200", failure_values)] if page == "sync-failures" else []
+        for failure in sync_failures:
+            failure["connection_mode"] = connection.get("mode", "demo_sp_api")
+        sessions = [dict(row) for row in conn.execute("SELECT session_id,username,created_at,expires_at,last_seen_at,revoked_at,user_agent,ip_masked FROM user_sessions WHERE username=? ORDER BY created_at DESC LIMIT 20", ((current_user or {}).get("sub", ""),))] if page == "settings" else []
+        account = row_dict(conn.execute("SELECT username,role,must_change_password,mfa_secret,mfa_enabled,password_changed_at,last_login_at FROM users WHERE username=?", ((current_user or {}).get("sub", ""),)).fetchone()) if page == "settings" else None
         settled_products = [p for p in products if p["economics"]["data_source"] == "结算流水"]
         economics_products = settled_products or products
         revenue = sum(p["economics"]["revenue"] for p in economics_products)
@@ -2211,6 +2555,8 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             filtered_products = [p for p in filtered_products if p["category"] == category_filter]
         if product_status in {"active", "inactive"}:
             filtered_products = [p for p in filtered_products if p.get("status") == product_status]
+        if page == "profit":
+            filtered_products.sort(key=lambda item: item["economics"]["net_profit"], reverse=True)
         filtered_listings = listings
         if q:
             needle = q.casefold()
@@ -2231,12 +2577,12 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             filtered_tickets = [ticket for ticket in filtered_tickets if ticket["status"] == ticket_status]
         if ticket_priority in {"P0", "P1", "P2"}:
             filtered_tickets = [ticket for ticket in filtered_tickets if ticket["priority"] == ticket_priority]
-        selected = filtered_products if page == "products" else filtered_listings if page == "listings" else filtered_orders if page == "orders" else filtered_tickets if page == "tickets" else audits if page == "audit" else []
+        selected = filtered_products if page in {"products", "profit", "inventory"} else filtered_listings if page == "listings" else filtered_orders if page == "orders" else filtered_tickets if page == "tickets" else feedback if page == "feedback" else audits if page == "audit" else sync_failures if page == "sync-failures" else []
         total_items = sql_page_total if sql_page_total is not None else len(selected)
         total_pages = max(1, math.ceil(total_items / page_size))
         page_no = min(page_no, total_pages)
         start = (page_no - 1) * page_size
-        if page == "products" and sql_page_total is None:
+        if page in {"products", "profit"} and sql_page_total is None:
             page_products = filtered_products[start:start + page_size]
         else:
             page_products = products
@@ -2246,7 +2592,7 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
             orders = filtered_orders[start:start + page_size]
         if page == "tickets" and sql_page_total is None:
             tickets = filtered_tickets[start:start + page_size]
-        revision_rows = conn.execute("SELECT listing_id,version,action,actor,reason,created_at FROM listing_revisions ORDER BY id DESC").fetchall()
+        revision_rows = conn.execute("SELECT listing_id,version,action,actor,reason,created_at FROM listing_revisions ORDER BY id DESC").fetchall() if page == "listings" else []
         revisions: dict[int, list[dict[str, Any]]] = {}
         for revision in revision_rows:
             revisions.setdefault(revision["listing_id"], []).append(dict(revision))
@@ -2285,13 +2631,13 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
     message_status_labels = {"draft": "待审核", "approved": "已批准", "pending_send": "发送中", "sent_demo": "模拟发送成功", "failed": "发送失败"}
     order_status_labels = {"pending": "待确认", "unshipped": "待发货", "shipped": "已发货", "delivered": "已送达", "cancelled": "已取消", "partially_refunded": "部分退款", "refunded": "已退款"}
     return {"page": page, "products": page_products, "listings": listings, "orders": orders, "tickets": tickets, "feedback": feedback,
-            "replenishment_plans": replenishment_plans, "purchase_orders": purchase_orders,
+            "replenishment_plans": replenishment_plans, "purchase_orders": purchase_orders, "inventory_adjustments": inventory_adjustments,
             "audits": audits, "jobs": jobs, "notifications": notifications, "metrics": metrics, "business_totals": business_totals, "today_tasks": today_tasks,
-            "ai_usage": ai_usage,
+            "ai_usage": ai_usage, "sync_failures": sync_failures, "current_permissions": permissions,
             "users": users, "sessions": sessions, "account": account,
             "connection": connection, "ai_mode": ai_config()["mode"], "ticket_status_labels": ticket_status_labels, "message_status_labels": message_status_labels,
             "status_labels": status_labels, "provider_labels": provider_labels, "categories": categories,
-            "filters": {"q": q, "category": category_filter, "product_status": product_status, "listing_status": listing_status, "order_status": order_status, "ticket_status": ticket_status, "ticket_priority": ticket_priority, "date_from": date_from, "date_to": date_to},
+            "filters": {"q": q, "category": category_filter, "product_status": product_status, "listing_status": listing_status, "order_status": order_status, "ticket_status": ticket_status, "ticket_priority": ticket_priority, "failure_status": failure_status, "date_from": date_from, "date_to": date_to},
             "pagination": {"page": page_no, "pages": total_pages, "total": total_items}, "revisions": revisions,
             "order_status_labels": order_status_labels}
 
@@ -2299,12 +2645,15 @@ def page_context(page: str, params: dict[str, str] | None = None, current_user: 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     validate_runtime_config()
-    init_db()
+    if MIGRATE_ON_STARTUP:
+        init_db()
+    else:
+        check_schema_ready()
     yield
 
 
 app = FastAPI(
-    title="跨境智营台", version="0.2.0", lifespan=lifespan,
+    title="跨境智营台", version="0.3.0", lifespan=lifespan,
     docs_url=None if APP_ENV == "production" else "/docs",
     redoc_url=None if APP_ENV == "production" else "/redoc",
     openapi_url=None if APP_ENV == "production" else "/openapi.json",
@@ -2330,12 +2679,22 @@ PRIVATE_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 
+def user_has_permission(role: str, permission: str) -> bool:
+    with closing(connect()) as conn:
+        return bool(conn.execute("SELECT 1 FROM role_permissions WHERE role=? AND (permission=? OR permission='*')", (role, permission)).fetchone())
+
+
 @app.middleware("http")
 async def secure_requests(request: Request, call_next):
-    trace_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    supplied_trace = request.headers.get("X-Request-ID", "")
+    trace_id = supplied_trace if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", supplied_trace) else uuid.uuid4().hex
     trace_token = request_trace.set(trace_id)
-    public = request.url.path in {"/health", "/health/live", "/health/ready"} or request.url.path.startswith(("/static/", "/media/", "/login", "/docs", "/redoc", "/openapi.json"))
-    user = read_session(request.cookies.get("ops_session"), SESSION_SECRET)
+    health_probe = request.url.path == "/health/ready" and (APP_ENV != "production" or bool(HEALTH_TOKEN) and hmac.compare_digest(request.headers.get("X-Health-Token", ""), HEALTH_TOKEN))
+    public = request.url.path == "/health/live" or health_probe or request.url.path.startswith(("/static/", "/login", "/docs", "/redoc", "/openapi.json"))
+    session_token = request.cookies.get("ops_session")
+    user = read_session(session_token, SESSION_SECRET)
+    if not user and SESSION_SECRET_PREVIOUS:
+        user = read_session(session_token, SESSION_SECRET_PREVIOUS)
     if user and not public:
         try:
             with closing(connect()) as conn:
@@ -2352,13 +2711,18 @@ async def secure_requests(request: Request, call_next):
     started = datetime.now(timezone.utc)
     response = None
     try:
-        if not public:
+        content_length = request.headers.get("Content-Length")
+        if content_length and (not content_length.isdigit() or int(content_length) > MAX_REQUEST_BYTES):
+            response = JSONResponse({"detail": "请求体超过服务器限制"}, status_code=413)
+        elif not public:
             if not user:
                 response = JSONResponse({"detail": "请先登录"}, status_code=401) if request.url.path.startswith("/api/") else RedirectResponse("/login", status_code=303)
             elif account and account["must_change_password"] and request.url.path not in {"/settings", "/logout"} and not request.url.path.startswith("/api/account/"):
                 response = JSONResponse({"detail": "使用临时密码登录后必须先修改密码"}, status_code=403) if request.url.path.startswith("/api/") else RedirectResponse("/settings?must_change=1", status_code=303)
             elif not role_allows(user["role"], required_role(request.method, request.url.path)):
                 response = JSONResponse({"detail": "权限不足"}, status_code=403)
+            elif not user_has_permission(user["role"], required_permission(request.method, request.url.path)):
+                response = JSONResponse({"detail": "当前岗位没有该操作权限"}, status_code=403)
             elif request.method in {"POST", "PUT", "PATCH", "DELETE"} and not hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), user["csrf"]):
                 response = JSONResponse({"detail": "CSRF 校验失败"}, status_code=403)
             else:
@@ -2385,24 +2749,46 @@ def login_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request=request, name="login.html", context={"error": request.query_params.get("error")})
 
 
+def effective_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    if peer in TRUSTED_PROXY_IPS and forwarded:
+        try:
+            return str(ip_address(forwarded))
+        except ValueError:
+            return peer
+    return peer
+
+
+def record_login_failure(conn: sqlite3.Connection, attempts: dict[str, sqlite3.Row], identifiers: list[tuple[str, int]]) -> tuple[int, bool]:
+    highest_failures, locked = 0, False
+    for identifier, threshold in identifiers:
+        attempt = attempts.get(identifier)
+        failures = (attempt["failures"] if attempt else 0) + 1
+        locked_until = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="seconds") if failures >= threshold else None
+        conn.execute("INSERT INTO login_attempts(identifier,failures,first_at,locked_until) VALUES(?,?,?,?) ON CONFLICT(identifier) DO UPDATE SET failures=excluded.failures,locked_until=excluded.locked_until", (identifier, failures, attempt["first_at"] if attempt else now(), locked_until))
+        highest_failures = max(highest_failures, failures)
+        locked = locked or bool(locked_until)
+    return highest_failures, locked
+
+
 @app.post("/login", include_in_schema=False)
 def login(request: Request, username: str = Form(...), password: str = Form(...), otp: str = Form(default="")) -> RedirectResponse:
-    identifier = f"{request.client.host if request.client else 'unknown'}:{username.strip().lower()}"
+    ip = effective_client_ip(request)
+    identifiers = [(f"user:{ip}:{username.strip().lower()}", 5), (f"ip:{ip}", 20)]
     with closing(connect()) as conn:
-        attempt = conn.execute("SELECT * FROM login_attempts WHERE identifier=?", (identifier,)).fetchone()
-        if attempt and attempt["first_at"] < (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds"):
-            conn.execute("DELETE FROM login_attempts WHERE identifier=?", (identifier,))
-            attempt = None
-        if attempt and attempt["locked_until"] and attempt["locked_until"] > now():
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")
+        keys = [item[0] for item in identifiers]
+        conn.execute("DELETE FROM login_attempts WHERE identifier IN (?,?) AND first_at<?", (*keys, cutoff))
+        attempts = {row["identifier"]: row for row in conn.execute("SELECT * FROM login_attempts WHERE identifier IN (?,?)", keys)}
+        if any(row["locked_until"] and row["locked_until"] > now() for row in attempts.values()):
             return RedirectResponse("/login?error=locked", status_code=303)
         user = conn.execute("SELECT * FROM users WHERE username=? AND is_active=1", (username.strip(),)).fetchone()
         if not user or not verify_password(password, user["password_hash"]):
-            failures = (attempt["failures"] if attempt else 0) + 1
-            locked_until = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="seconds") if failures >= 5 else None
-            conn.execute("INSERT INTO login_attempts(identifier,failures,first_at,locked_until) VALUES(?,?,?,?) ON CONFLICT(identifier) DO UPDATE SET failures=excluded.failures,locked_until=excluded.locked_until", (identifier, failures, attempt["first_at"] if attempt else now(), locked_until))
+            failures, locked = record_login_failure(conn, attempts, identifiers)
             audit(conn, "login_failed", "user", None, {"username": username.strip(), "failures": failures})
             conn.commit()
-            return RedirectResponse("/login?error=invalid", status_code=303)
+            return RedirectResponse("/login?error=locked" if locked else "/login?error=invalid", status_code=303)
         mfa_ok = not user["mfa_enabled"]
         if user["mfa_enabled"] and user["mfa_secret"]:
             mfa_ok = verify_totp(decrypt_mfa_secret(user["mfa_secret"]), otp.strip())
@@ -2413,13 +2799,11 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
                     conn.execute("UPDATE mfa_recovery_codes SET used_at=? WHERE id=?", (now(), recovery["id"]))
                     mfa_ok = True
         if not mfa_ok:
-            failures = (attempt["failures"] if attempt else 0) + 1
-            locked_until = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="seconds") if failures >= 5 else None
-            conn.execute("INSERT INTO login_attempts(identifier,failures,first_at,locked_until) VALUES(?,?,?,?) ON CONFLICT(identifier) DO UPDATE SET failures=excluded.failures,locked_until=excluded.locked_until", (identifier, failures, attempt["first_at"] if attempt else now(), locked_until))
+            failures, locked = record_login_failure(conn, attempts, identifiers)
             audit(conn, "login_mfa_failed", "user", None, {"username": user["username"], "failures": failures})
             conn.commit()
-            return RedirectResponse("/login?error=locked" if locked_until else "/login?error=otp", status_code=303)
-        conn.execute("DELETE FROM login_attempts WHERE identifier=?", (identifier,))
+            return RedirectResponse("/login?error=locked" if locked else "/login?error=otp", status_code=303)
+        conn.execute("DELETE FROM login_attempts WHERE identifier IN (?,?)", keys)
         audit(conn, "login_succeeded", "user", None, {"username": user["username"]})
         conn.execute("UPDATE users SET last_login_at=? WHERE username=?", (now(), user["username"]))
         conn.commit()
@@ -2427,7 +2811,6 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     token, csrf = create_session(user["username"], user["role"], SESSION_SECRET, session_id=session_id)
     timestamp = now()
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat(timespec="seconds")
-    ip = request.client.host if request.client else "unknown"
     ip_masked = re.sub(r"(?<=\.)\d+$", "*", ip) if "." in ip else ip[:4] + "***"
     with closing(connect()) as conn:
         conn.execute("INSERT INTO user_sessions(session_id,username,created_at,expires_at,last_seen_at,user_agent,ip_masked) VALUES(?,?,?,?,?,?,?)", (session_id, user["username"], timestamp, expires_at, timestamp, request.headers.get("user-agent", "unknown")[:300], ip_masked))
@@ -2464,22 +2847,26 @@ def health() -> dict[str, Any]:
             failed_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='failed'").fetchone()[0]
             queued_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'").fetchone()[0]
             audit_chain_ok = verify_audit_tail(conn)
+            audit_checkpoint_ok = verify_latest_audit_checkpoint(conn)
             integrity = conn.execute("PRAGMA quick_check").fetchone()[0]
         database = "ok"
     except sqlite3.Error:
         database = "error"
         schema_version = 0
-        connection, failed_jobs, queued_jobs, audit_chain_ok, integrity = None, 0, 0, False, "error"
+        connection, failed_jobs, queued_jobs, audit_chain_ok, audit_checkpoint_ok, integrity = None, 0, 0, False, False, "error"
     config = ai_config()
     worker = worker_health() if database == "ok" else {"status": "unknown", "healthy": False}
-    channel_healthy = bool(connection and connection["status"] == "connected_demo")
-    backup_files = sorted(BACKUP_ROOT.glob("app-*.db"), key=lambda path: path.stat().st_mtime, reverse=True) if BACKUP_ROOT.is_dir() else []
-    backup = {"status": "ok" if backup_files else "missing", "latest_at": datetime.fromtimestamp(backup_files[0].stat().st_mtime, timezone.utc).isoformat(timespec="seconds") if backup_files else None}
-    healthy = database == "ok" and integrity == "ok" and audit_chain_ok and schema_version >= 18 and worker["healthy"] and channel_healthy
+    channel_healthy = bool(connection and connection["status"] in {"connected_demo", "connected"})
+    with closing(connect()) as conn:
+        backup_run = row_dict(conn.execute("SELECT * FROM backup_runs WHERE status='success' ORDER BY completed_at DESC LIMIT 1").fetchone())
+    backup_fresh = bool(backup_run and backup_run["completed_at"] >= (datetime.now(timezone.utc) - timedelta(hours=BACKUP_MAX_AGE_HOURS)).isoformat(timespec="seconds"))
+    backup_files_ok = bool(backup_run and backup_run.get("backup_path") and Path(backup_run["backup_path"]).is_file() and backup_run.get("replica_path") and Path(backup_run["replica_path"]).is_file())
+    backup = {"status": "ok" if backup_fresh and backup_files_ok else "stale_or_missing", "latest_at": backup_run["completed_at"] if backup_run else None, "replica_verified": backup_files_ok}
+    healthy = database == "ok" and integrity == "ok" and audit_chain_ok and audit_checkpoint_ok and schema_version >= 21 and worker["healthy"] and channel_healthy and (APP_ENV != "production" or backup["status"] == "ok")
     return {"status": "ok" if healthy else "degraded", "database": database, "schema_version": schema_version,
             "environment": APP_ENV, "ai_provider": config["mode"], "ai_configured": config["mode"] != "demo",
             "model": config["model"], "worker": worker, "channel": {"healthy": channel_healthy, "mode": connection["mode"] if connection else None},
-            "jobs": {"queued": queued_jobs, "failed": failed_jobs}, "audit_chain": "ok" if audit_chain_ok else "error",
+            "jobs": {"queued": queued_jobs, "failed": failed_jobs}, "audit_chain": "ok" if audit_chain_ok else "error", "audit_checkpoint": "ok" if audit_checkpoint_ok else "error",
             "database_integrity": integrity, "backup": backup}
 
 
@@ -2490,8 +2877,9 @@ def verify_full_audit_log() -> dict[str, Any]:
         event_count = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         valid = verify_audit_chain(conn)
         audit(conn, "audit_chain_verified", "audit", None, {"event_count": event_count, "valid": valid})
+        checkpoint = create_audit_checkpoint(conn)
         conn.commit()
-    return {"valid": valid, "event_count": event_count, "duration_ms": int((time.perf_counter() - started) * 1000)}
+    return {"valid": valid, "event_count": event_count, "checkpoint_event_id": checkpoint["last_event_id"] if checkpoint else None, "duration_ms": int((time.perf_counter() - started) * 1000)}
 
 
 @app.post("/api/notifications/{notification_id}/read")
@@ -2536,7 +2924,10 @@ def amazon_us_status() -> dict[str, Any]:
         value = row_dict(conn.execute("SELECT * FROM channel_connections WHERE channel='amazon-us'").fetchone())
     if not value:
         raise HTTPException(503, "演示渠道尚未初始化")
-    value["connection_label"] = "Amazon US · 模拟 SP-API · 演示连接正常"
+    if value["mode"] == "demo_sp_api":
+        value["connection_label"] = "Amazon US · 模拟 SP-API · 演示连接正常"
+    else:
+        value["connection_label"] = "Amazon US · 已授权渠道网关 · 连接正常" if value["status"] == "connected" else "Amazon US · 渠道网关已配置 · 等待首次成功同步"
     value["last_result"] = json.loads(value["last_result"]) if value.get("last_result") else None
     return value
 
@@ -2628,13 +3019,17 @@ async def import_products(file: UploadFile = File(...)) -> dict[str, Any]:
                 seen_sku.add(item["sku"]); seen_asin.add(item["asin"])
                 timestamp = now()
                 product_id = conn.execute(
-                    f"INSERT INTO products({','.join(PRODUCT_FIELDS)},{','.join(OPTIONAL_PRODUCT_FIELDS)},created_at,updated_at) VALUES({','.join('?' for _ in range(len(PRODUCT_FIELDS) + len(OPTIONAL_PRODUCT_FIELDS) + 2))})",
-                    (*[item[key] for key in PRODUCT_FIELDS], *[optional[key] for key in OPTIONAL_PRODUCT_FIELDS], timestamp, timestamp),
+                    f"INSERT INTO products({','.join(PRODUCT_FIELDS)},{','.join(OPTIONAL_PRODUCT_FIELDS)},price_cents,cost_cents,created_at,updated_at) VALUES({','.join('?' for _ in range(len(PRODUCT_FIELDS) + len(OPTIONAL_PRODUCT_FIELDS) + 4))})",
+                    (*[item[key] for key in PRODUCT_FIELDS], *[optional[key] for key in OPTIONAL_PRODUCT_FIELDS], money_to_cents(item["price"]), money_to_cents(item["cost"]), timestamp, timestamp),
                 ).lastrowid
                 product = row_dict(conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone())
                 conn.execute(
                     "INSERT INTO cost_profiles(product_id,referral_rate,fba_fee_per_unit,inbound_cost_per_unit,ad_rate,other_cost_per_unit,effective_from,updated_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (product_id, 0.15, round(3.40 + min(item["price"] * 0.04, 2.0), 2), round(max(0.55, item["cost"] * 0.12), 2), round(0.08 + item["competition_score"] / 100 * 0.08, 4), 0, timestamp, request_actor.get(), timestamp),
+                )
+                conn.execute(
+                    "INSERT INTO cost_profile_versions(product_id,referral_rate,fba_fee_per_unit_cents,inbound_cost_per_unit_cents,ad_rate,other_cost_per_unit_cents,product_cost_per_unit_cents,effective_from,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (product_id, 0.15, money_to_cents(round(3.40 + min(item["price"] * 0.04, 2.0), 2)), money_to_cents(round(max(0.55, item["cost"] * 0.12), 2)), round(0.08 + item["competition_score"] / 100 * 0.08, 4), 0, money_to_cents(item["cost"]), timestamp, request_actor.get(), timestamp),
                 )
                 for field_name, field_value in (("source_title", item["source_title"]), *[(field, optional[field]) for field in ("brand", "material", "dimensions_cm", "weight_kg", "color", "package_contents", "origin_country", "upc_ean") if str(optional[field]).strip() and str(optional[field]) != "0.0"]):
                     conn.execute("INSERT INTO product_evidence(product_id,field_name,value,source_name,source_reference,status,created_by,created_at) VALUES(?,?,?,?,?,'pending',?,?)", (product_id, field_name, str(field_value), "商品 CSV 导入", f"import-line-{line}", request_actor.get(), timestamp))
@@ -2699,7 +3094,7 @@ def update_product(
     tags = [tag.strip() for tag in re.split(r"[,，;；]", compliance_tags) if tag.strip()]
     timestamp = now()
     values = (
-        source_title, category, brand.strip(), price, cost, parent_sku.strip() or None, variation_theme.strip(),
+        source_title, category, brand.strip(), price, cost, money_to_cents(price), money_to_cents(cost), parent_sku.strip() or None, variation_theme.strip(),
         material.strip(), dimensions_cm.strip(), weight_kg, color.strip(), package_contents.strip(), supplier_name.strip(),
         supplier_sku.strip(), moq, purchase_lead_days, origin_country.strip(), upc_ean.strip(),
         json.dumps(tags, ensure_ascii=False), evidence_notes.strip(), status, timestamp, product_id, version,
@@ -2707,7 +3102,7 @@ def update_product(
     with closing(connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         result = conn.execute(
-            """UPDATE products SET source_title=?,category=?,brand=?,price=?,cost=?,parent_sku=?,variation_theme=?,
+            """UPDATE products SET source_title=?,category=?,brand=?,price=?,cost=?,price_cents=?,cost_cents=?,parent_sku=?,variation_theme=?,
             material=?,dimensions_cm=?,weight_kg=?,color=?,package_contents=?,supplier_name=?,supplier_sku=?,moq=?,
             purchase_lead_days=?,origin_country=?,upc_ean=?,compliance_tags=?,evidence_notes=?,status=?,
             version=version+1,updated_at=? WHERE id=? AND version=?""",
@@ -2850,8 +3245,8 @@ def generate_listing(product_id: int) -> dict[str, Any]:
             timestamp = now()
             review_notes = value.get("review_notes_cn") or "美国站英文草稿。请人工核对规格证据、关键词、商标和合规风险。"
             listing_id = conn.execute(
-                "INSERT INTO listings(product_id,title,bullet_points,description,search_terms,title_zh,bullet_points_zh,description_zh,search_terms_zh,compliance_warnings,status,provider,review_notes_cn,evidence_snapshot,compliance_status,compliance_errors,prompt_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (product_id, value["title"], json.dumps(value["bullet_points"]), value["description"], json.dumps(value["search_terms"]), value["title_zh"], json.dumps(value["bullet_points_zh"], ensure_ascii=False), value["description_zh"], json.dumps(value["search_terms_zh"], ensure_ascii=False), json.dumps(value["compliance_warnings"], ensure_ascii=False), "draft", provider, review_notes, json.dumps(product["verified_facts"], ensure_ascii=False), compliance_status, json.dumps(compliance_errors, ensure_ascii=False), LISTING_PROMPT_VERSION, timestamp, timestamp),
+                "INSERT INTO listings(product_id,title,bullet_points,description,search_terms,title_zh,bullet_points_zh,description_zh,search_terms_zh,compliance_warnings,status,provider,review_notes_cn,evidence_snapshot,compliance_status,compliance_errors,prompt_version,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (product_id, value["title"], json.dumps(value["bullet_points"]), value["description"], json.dumps(value["search_terms"]), value["title_zh"], json.dumps(value["bullet_points_zh"], ensure_ascii=False), value["description_zh"], json.dumps(value["search_terms_zh"], ensure_ascii=False), json.dumps(value["compliance_warnings"], ensure_ascii=False), "draft", provider, review_notes, json.dumps(product["verified_facts"], ensure_ascii=False), compliance_status, json.dumps(compliance_errors, ensure_ascii=False), LISTING_PROMPT_VERSION, f"ai:{provider}", timestamp, timestamp),
             ).lastrowid
             conn.execute("UPDATE ai_runs SET provider=?,model=?,status='success',output_snapshot=?,latency_ms=?,input_tokens=?,output_tokens=?,estimated_cost_usd=? WHERE id=?", (provider, model, json.dumps(value, ensure_ascii=False), usage["latency_ms"], usage["input_tokens"], usage["output_tokens"], usage["estimated_cost_usd"], run_id))
             record_listing_revision(conn, listing_id, "generated")
@@ -2896,6 +3291,11 @@ def approve_listing(
             "search_terms_zh": [x.strip() for x in re.split(r"[,，]", search_terms_zh) if x.strip()] if search_terms_zh is not None else json.loads(listing["search_terms_zh"]),
             "compliance_warnings": json.loads(listing["compliance_warnings"]),
         }
+        current = listing_snapshot(listing)
+        editable = ("title", "bullet_points", "description", "search_terms", "title_zh", "bullet_points_zh", "description_zh", "search_terms_zh")
+        if any(value[key] != current[key] for key in editable):
+            raise HTTPException(409, "批准操作不能同时修改文案；请先保存草稿，再由另一账号批准")
+        require_independent_approver(request_actor.get(), listing.get("created_by"), listing.get("edited_by"))
         try:
             validate_listing(value)
         except ValueError as exc:
@@ -2911,9 +3311,46 @@ def approve_listing(
         if not result.rowcount:
             raise HTTPException(409, "文案已被其他人修改，请刷新后重试")
         record_listing_revision(conn, listing_id, "approved")
-        audit(conn, "listing_approved", "listing", listing_id, {"edited": any(x is not None for x in (title, bullet_points, description, search_terms, title_zh, bullet_points_zh, description_zh, search_terms_zh))})
+        audit(conn, "listing_approved", "listing", listing_id, {"edited": False})
         conn.commit()
     return {"listing_id": listing_id, "status": "approved", "version": version + 1}
+
+
+@app.post("/api/listings/{listing_id}/save")
+def save_listing(
+    listing_id: int,
+    version: int = Form(...),
+    title: str = Form(...), bullet_points: str = Form(...), description: str = Form(...), search_terms: str = Form(...),
+    title_zh: str = Form(...), bullet_points_zh: str = Form(...), description_zh: str = Form(...), search_terms_zh: str = Form(...),
+) -> dict[str, Any]:
+    value = {
+        "title": title.strip(), "bullet_points": [x.strip() for x in bullet_points.splitlines() if x.strip()],
+        "description": description.strip(), "search_terms": [x.strip() for x in search_terms.split(",") if x.strip()],
+        "title_zh": title_zh.strip(), "bullet_points_zh": [x.strip() for x in bullet_points_zh.splitlines() if x.strip()],
+        "description_zh": description_zh.strip(), "search_terms_zh": [x.strip() for x in re.split(r"[,，]", search_terms_zh) if x.strip()],
+        "compliance_warnings": [],
+    }
+    try:
+        validate_listing(value)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    with closing(connect()) as conn:
+        listing = row_dict(conn.execute("SELECT * FROM listings WHERE id=?", (listing_id,)).fetchone())
+        if not listing:
+            raise HTTPException(404, "Listing 不存在")
+        if listing["status"] == "mock_published":
+            raise HTTPException(409, "已发布快照不能修改")
+        errors, warnings = listing_compliance_check(conn, listing["product_id"], value)
+        result = conn.execute(
+            "UPDATE listings SET title=?,bullet_points=?,description=?,search_terms=?,title_zh=?,bullet_points_zh=?,description_zh=?,search_terms_zh=?,compliance_warnings=?,status='draft',edited_by=?,approved_by=NULL,approved_at=NULL,rejection_reason=NULL,compliance_status=?,compliance_errors=?,version=version+1,updated_at=? WHERE id=? AND version=? AND status IN ('draft','rejected','approved')",
+            (value["title"], json.dumps(value["bullet_points"]), value["description"], json.dumps(value["search_terms"]), value["title_zh"], json.dumps(value["bullet_points_zh"], ensure_ascii=False), value["description_zh"], json.dumps(value["search_terms_zh"], ensure_ascii=False), json.dumps(warnings, ensure_ascii=False), request_actor.get(), "passed" if not errors else "blocked", json.dumps(errors, ensure_ascii=False), now(), listing_id, version),
+        )
+        if not result.rowcount:
+            raise HTTPException(409, "文案状态或版本已变化")
+        record_listing_revision(conn, listing_id, "saved")
+        audit(conn, "listing_saved", "listing", listing_id, {"compliance_errors": errors})
+        conn.commit()
+    return {"listing_id": listing_id, "status": "draft", "version": version + 1, "compliance_status": "passed" if not errors else "blocked", "compliance_errors": errors}
 
 
 @app.post("/api/listings/{listing_id}/reject")
@@ -2985,6 +3422,11 @@ def bulk_approve_listings(items: str = Form(...)) -> dict[str, Any]:
             listing = row_dict(conn.execute("SELECT * FROM listings WHERE id=?", (listing_id,)).fetchone())
             if not listing or listing["version"] != version or listing["status"] not in {"draft", "rejected", "approved"}:
                 errors.append({"listing_id": listing_id, "error": "状态或版本已变化"})
+                continue
+            try:
+                require_independent_approver(request_actor.get(), listing.get("created_by"), listing.get("edited_by"))
+            except HTTPException as exc:
+                errors.append({"listing_id": listing_id, "error": exc.detail})
                 continue
             try:
                 listing_value = validate_listing(listing_snapshot(listing))
@@ -3061,7 +3503,7 @@ def create_replenishment_plan(product_id: int, safety_days: int = Form(default=1
         lead_time = int(product["purchase_lead_days"] or (snapshot["lead_time_days"] if snapshot else product["lead_time_days"]))
         inbound = int(snapshot["inbound"] if snapshot else 0)
         warehouse = conn.execute("SELECT on_hand FROM warehouse_inventory WHERE sku=?", (product["sku"],)).fetchone()
-        open_po = conn.execute("SELECT COALESCE(SUM(poi.ordered_qty-poi.received_qty-poi.rejected_qty),0) FROM purchase_order_items poi JOIN purchase_orders po ON po.id=poi.purchase_order_id WHERE poi.sku=? AND po.status IN ('draft','approved','sent_demo','partially_received')", (product["sku"],)).fetchone()[0]
+        open_po = conn.execute("SELECT COALESCE(SUM(poi.ordered_qty-poi.received_qty-poi.rejected_qty),0) FROM purchase_order_items poi JOIN purchase_orders po ON po.id=poi.purchase_order_id WHERE poi.sku=? AND po.status IN ('approved','sent_demo','partially_received')", (product["sku"],)).fetchone()[0]
         pipeline = inbound + int(warehouse["on_hand"] if warehouse else 0) + int(open_po)
         raw_suggested = max(0, math.ceil(daily_sales * (lead_time + safety_days) - fulfillable - pipeline))
         suggested = math.ceil(raw_suggested / product["moq"]) * product["moq"]
@@ -3079,14 +3521,26 @@ def create_replenishment_plan(product_id: int, safety_days: int = Form(default=1
 def update_cost_profile(product_id: int, referral_rate: float = Form(...), fba_fee_per_unit: float = Form(...), inbound_cost_per_unit: float = Form(...), ad_rate: float = Form(...), other_cost_per_unit: float = Form(default=0), effective_from: str = Form(...)) -> dict[str, Any]:
     if not 0 <= referral_rate <= 1 or not 0 <= ad_rate <= 1 or min(fba_fee_per_unit, inbound_cost_per_unit, other_cost_per_unit) < 0 or not effective_from.strip():
         raise HTTPException(422, "成本费率或生效日期无效")
+    try:
+        datetime.fromisoformat(effective_from.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(422, "生效日期必须是 ISO 日期或时间") from exc
     with closing(connect()) as conn:
-        if not conn.execute("SELECT 1 FROM products WHERE id=?", (product_id,)).fetchone():
+        product = conn.execute("SELECT cost_cents FROM products WHERE id=?", (product_id,)).fetchone()
+        if not product:
             raise HTTPException(404, "商品不存在")
+        try:
+            conn.execute(
+                "INSERT INTO cost_profile_versions(product_id,referral_rate,fba_fee_per_unit_cents,inbound_cost_per_unit_cents,ad_rate,other_cost_per_unit_cents,product_cost_per_unit_cents,effective_from,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (product_id, referral_rate, money_to_cents(fba_fee_per_unit), money_to_cents(inbound_cost_per_unit), ad_rate, money_to_cents(other_cost_per_unit), product["cost_cents"], effective_from.strip(), request_actor.get(), now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "该生效日期已存在成本版本，请使用新的生效时间") from exc
         conn.execute("""INSERT INTO cost_profiles(product_id,referral_rate,fba_fee_per_unit,inbound_cost_per_unit,ad_rate,other_cost_per_unit,effective_from,updated_by,updated_at)
             VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(product_id) DO UPDATE SET referral_rate=excluded.referral_rate,fba_fee_per_unit=excluded.fba_fee_per_unit,
             inbound_cost_per_unit=excluded.inbound_cost_per_unit,ad_rate=excluded.ad_rate,other_cost_per_unit=excluded.other_cost_per_unit,effective_from=excluded.effective_from,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
             (product_id, referral_rate, fba_fee_per_unit, inbound_cost_per_unit, ad_rate, other_cost_per_unit, effective_from.strip(), request_actor.get(), now()))
-        audit(conn, "cost_profile_updated", "product", product_id, {"referral_rate": referral_rate, "ad_rate": ad_rate, "effective_from": effective_from.strip()})
+        audit(conn, "cost_profile_updated", "product", product_id, {"referral_rate": referral_rate, "ad_rate": ad_rate, "effective_from": effective_from.strip(), "immutable_version": True})
         conn.commit()
     return {"product_id": product_id, "status": "updated", "effective_from": effective_from.strip()}
 
@@ -3099,6 +3553,7 @@ def approve_replenishment_plan(plan_id: int, version: int = Form(...), approved_
         plan = conn.execute("SELECT rp.*,p.moq FROM replenishment_plans rp JOIN products p ON p.id=rp.product_id WHERE rp.id=?", (plan_id,)).fetchone()
         if not plan:
             raise HTTPException(404, "补货计划不存在")
+        require_independent_approver(request_actor.get(), plan["created_by"])
         if approved_qty % plan["moq"]:
             raise HTTPException(422, f"批准数量必须是 MOQ {plan['moq']} 的整数倍")
         result = conn.execute("UPDATE replenishment_plans SET status='approved',approved_qty=?,approved_by=?,approved_at=?,version=version+1 WHERE id=? AND version=? AND status='draft'", (approved_qty, request_actor.get(), now(), plan_id, version))
@@ -3133,10 +3588,11 @@ def convert_replenishment_plan(plan_id: int) -> dict[str, Any]:
         supplier = conn.execute("SELECT * FROM suppliers WHERE name=? AND status='active'", (plan["supplier_name"],)).fetchone() if plan["supplier_name"] else None
         supplier = supplier or conn.execute("SELECT * FROM suppliers WHERE supplier_code='SUP-GENERAL-US'").fetchone()
         po_number = f"PO-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:6].upper()}"
-        total = round(plan["approved_qty"] * plan["cost"], 2)
+        total_cents = int(plan["approved_qty"]) * money_to_cents(plan["cost"])
+        total = cents_to_money(total_cents)
         expected_at = (datetime.now(timezone.utc) + timedelta(days=max(plan["lead_time_days"], supplier["lead_time_days"]))).isoformat(timespec="seconds")
-        po_id = conn.execute("INSERT INTO purchase_orders(po_number,supplier_id,status,currency,total_amount,expected_at,created_by,created_at) VALUES(?,?,'draft',?,?,?,?,?)", (po_number, supplier["id"], supplier["currency"], total, expected_at, request_actor.get(), now())).lastrowid
-        conn.execute("INSERT INTO purchase_order_items(purchase_order_id,replenishment_plan_id,product_id,sku,ordered_qty,unit_cost) VALUES(?,?,?,?,?,?)", (po_id, plan_id, plan["product_id"], plan["sku"], plan["approved_qty"], plan["cost"]))
+        po_id = conn.execute("INSERT INTO purchase_orders(po_number,supplier_id,status,currency,total_amount,total_amount_cents,expected_at,created_by,created_at) VALUES(?,?,'draft',?,?,?,?,?,?)", (po_number, supplier["id"], supplier["currency"], total, total_cents, expected_at, request_actor.get(), now())).lastrowid
+        conn.execute("INSERT INTO purchase_order_items(purchase_order_id,replenishment_plan_id,product_id,sku,ordered_qty,unit_cost,unit_cost_cents) VALUES(?,?,?,?,?,?,?)", (po_id, plan_id, plan["product_id"], plan["sku"], plan["approved_qty"], plan["cost"], money_to_cents(plan["cost"])))
         conn.execute("UPDATE replenishment_plans SET status='converted',version=version+1 WHERE id=? AND status='approved'", (plan_id,))
         audit(conn, "purchase_order_created", "purchase_order", po_id, {"po_number": po_number, "plan_id": plan_id, "total": total})
         conn.commit()
@@ -3146,6 +3602,10 @@ def convert_replenishment_plan(plan_id: int) -> dict[str, Any]:
 @app.post("/api/purchase-orders/{po_id}/approve")
 def approve_purchase_order(po_id: int, version: int = Form(...)) -> dict[str, Any]:
     with closing(connect()) as conn:
+        purchase_order = conn.execute("SELECT created_by FROM purchase_orders WHERE id=?", (po_id,)).fetchone()
+        if not purchase_order:
+            raise HTTPException(404, "采购单不存在")
+        require_independent_approver(request_actor.get(), purchase_order["created_by"])
         result = conn.execute("UPDATE purchase_orders SET status='approved',approved_by=?,approved_at=?,version=version+1 WHERE id=? AND version=? AND status='draft'", (request_actor.get(), now(), po_id, version))
         if not result.rowcount:
             raise HTTPException(409, "采购单状态或版本已变化")
@@ -3163,6 +3623,55 @@ def send_purchase_order_demo(po_id: int, version: int = Form(...)) -> dict[str, 
         audit(conn, "purchase_order_sent_demo", "purchase_order", po_id, {"external_execution": False})
         conn.commit()
     return {"purchase_order_id": po_id, "status": "sent_demo", "external_execution": False, "version": version + 1}
+
+
+@app.post("/api/purchase-orders/{po_id}/cancellation")
+def request_purchase_order_cancellation(po_id: int, reason: str = Form(...)) -> dict[str, Any]:
+    reason = reason.strip()
+    if len(reason) < 3:
+        raise HTTPException(422, "必须填写取消原因")
+    with closing(connect()) as conn:
+        purchase_order = conn.execute("SELECT * FROM purchase_orders WHERE id=? AND status IN ('draft','approved','sent_demo')", (po_id,)).fetchone()
+        received = conn.execute("SELECT COALESCE(SUM(received_qty+rejected_qty),0) FROM purchase_order_items WHERE purchase_order_id=?", (po_id,)).fetchone()[0]
+        if not purchase_order or received:
+            raise HTTPException(409, "该采购单状态或收货情况不允许取消")
+        try:
+            cancellation_id = conn.execute("INSERT INTO purchase_order_cancellations(purchase_order_id,reason,status,requested_by,requested_at) VALUES(?,?,'requested',?,?)", (po_id, reason, request_actor.get(), now())).lastrowid
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "该采购单已有取消申请") from exc
+        audit(conn, "purchase_order_cancellation_requested", "purchase_order", po_id, {"cancellation_id": cancellation_id, "reason": reason})
+        conn.commit()
+    return {"cancellation_id": cancellation_id, "status": "requested"}
+
+
+@app.post("/api/purchase-order-cancellations/{cancellation_id}/approve")
+def approve_purchase_order_cancellation(cancellation_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        cancellation = conn.execute("SELECT * FROM purchase_order_cancellations WHERE id=?", (cancellation_id,)).fetchone()
+        if not cancellation:
+            raise HTTPException(404, "采购单取消申请不存在")
+        require_independent_approver(request_actor.get(), cancellation["requested_by"])
+        if not conn.execute("UPDATE purchase_order_cancellations SET status='approved',approved_by=?,approved_at=? WHERE id=? AND status='requested'", (request_actor.get(), now(), cancellation_id)).rowcount:
+            raise HTTPException(409, "采购单取消状态已变化")
+        audit(conn, "purchase_order_cancellation_approved", "purchase_order_cancellation", cancellation_id, {})
+        conn.commit()
+    return {"cancellation_id": cancellation_id, "status": "approved"}
+
+
+@app.post("/api/purchase-order-cancellations/{cancellation_id}/apply")
+def apply_purchase_order_cancellation(cancellation_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cancellation = conn.execute("SELECT * FROM purchase_order_cancellations WHERE id=? AND status='approved'", (cancellation_id,)).fetchone()
+        if not cancellation:
+            raise HTTPException(409, "采购单取消必须先批准")
+        received = conn.execute("SELECT COALESCE(SUM(received_qty+rejected_qty),0) FROM purchase_order_items WHERE purchase_order_id=?", (cancellation["purchase_order_id"],)).fetchone()[0]
+        if received or not conn.execute("UPDATE purchase_orders SET status='cancelled',version=version+1 WHERE id=? AND status IN ('draft','approved','sent_demo')", (cancellation["purchase_order_id"],)).rowcount:
+            raise HTTPException(409, "采购单已收货或状态已变化")
+        conn.execute("UPDATE purchase_order_cancellations SET status='applied',applied_at=? WHERE id=?", (now(), cancellation_id))
+        audit(conn, "purchase_order_cancellation_applied", "purchase_order", cancellation["purchase_order_id"], {"cancellation_id": cancellation_id})
+        conn.commit()
+    return {"cancellation_id": cancellation_id, "status": "applied"}
 
 
 @app.post("/api/purchase-order-items/{item_id}/receive")
@@ -3404,15 +3913,26 @@ def reopen_ticket(ticket_id: int, reason: str = Form(...), version: int = Form(.
 @app.post("/api/tickets/{ticket_id}/service-actions")
 def create_service_action(ticket_id: int, action_type: str = Form(...), amount: float = Form(default=0), reason: str = Form(...)) -> dict[str, Any]:
     reason = reason.strip()
-    if action_type not in {"refund", "reship", "replacement", "cancel"} or amount < 0 or len(reason) < 3:
+    try:
+        amount_cents = money_to_cents(amount)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "售后金额无效")
+    if action_type not in {"refund", "reship", "replacement", "cancel"} or amount_cents < 0 or len(reason) < 3:
         raise HTTPException(422, "售后动作、金额或原因无效")
+    if action_type == "refund" and amount_cents <= 0:
+        raise HTTPException(422, "退款金额必须大于 0")
+    if action_type != "refund" and amount_cents:
+        raise HTTPException(422, "补发、替换和取消只记录动作，不允许填写退款金额")
     with closing(connect()) as conn:
         ticket = conn.execute("SELECT order_ref_id FROM tickets WHERE id=? AND COALESCE(is_archived,0)=0", (ticket_id,)).fetchone()
         if not ticket:
             raise HTTPException(404, "工单不存在")
         if action_type in {"refund", "reship", "replacement", "cancel"} and not ticket["order_ref_id"]:
             raise HTTPException(409, "售后动作必须关联已同步订单")
-        action_id = conn.execute("INSERT INTO service_actions(ticket_id,order_id,action_type,amount,reason,status,requested_by,requested_at) VALUES(?,?,?,?,?,'requested',?,?)", (ticket_id, ticket["order_ref_id"], action_type, amount, reason, request_actor.get(), now())).lastrowid
+        remaining_cents, currency = refundable_balance_cents(conn, ticket["order_ref_id"])
+        if action_type == "refund" and amount_cents > remaining_cents:
+            raise HTTPException(409, f"退款金额超过订单剩余可退金额 {currency} {cents_to_money(remaining_cents):.2f}")
+        action_id = conn.execute("INSERT INTO service_actions(ticket_id,order_id,action_type,amount,amount_cents,currency,reason,status,requested_by,requested_at) VALUES(?,?,?,?,?,?,?,'requested',?,?)", (ticket_id, ticket["order_ref_id"], action_type, cents_to_money(amount_cents), amount_cents, currency, reason, request_actor.get(), now())).lastrowid
         conn.execute("INSERT INTO ticket_events(ticket_id,event_type,actor,body,metadata,created_at) VALUES(?,?,?,?,?,?)", (ticket_id, "service_action_requested", request_actor.get(), reason, json.dumps({"action_id": action_id, "action_type": action_type, "amount": amount}, ensure_ascii=False), now()))
         audit(conn, "service_action_requested", "ticket", ticket_id, {"action_id": action_id, "action_type": action_type, "amount": amount})
         conn.commit()
@@ -3475,9 +3995,9 @@ async def upload_ticket_attachment(ticket_id: int, file: UploadFile = File(...))
         timestamp = now()
         expires_at = (datetime.now(timezone.utc) + timedelta(days=ATTACHMENT_RETENTION_DAYS)).isoformat(timespec="seconds")
         try:
-            target.write_bytes(content)
+            target.write_bytes(attachment_cipher().encrypt(content))
             attachment_id = conn.execute(
-                "INSERT INTO ticket_attachments(ticket_id,stored_name,original_name,content_type,size_bytes,sha256,scan_status,uploaded_by,created_at,expires_at) VALUES(?,?,?,?,?,?,'clean',?,?,?)",
+                "INSERT INTO ticket_attachments(ticket_id,stored_name,original_name,content_type,size_bytes,sha256,scan_status,uploaded_by,created_at,expires_at,encrypted) VALUES(?,?,?,?,?,?,'clean',?,?,?,1)",
                 (ticket_id, stored_name, original_name, file.content_type, len(content), digest, request_actor.get(), timestamp, expires_at),
             ).lastrowid
             audit(conn, "ticket_attachment_uploaded", "ticket", ticket_id, {"attachment_id": attachment_id, "size_bytes": len(content), "sha256": digest})
@@ -3489,7 +4009,7 @@ async def upload_ticket_attachment(ticket_id: int, file: UploadFile = File(...))
 
 
 @app.get("/api/tickets/{ticket_id}/attachments/{attachment_id}")
-def download_ticket_attachment(ticket_id: int, attachment_id: int) -> FileResponse:
+def download_ticket_attachment(ticket_id: int, attachment_id: int) -> Response:
     with closing(connect()) as conn:
         attachment = conn.execute("SELECT * FROM ticket_attachments WHERE id=? AND ticket_id=? AND deleted_at IS NULL AND scan_status='clean' AND (expires_at IS NULL OR expires_at>?)", (attachment_id, ticket_id, now())).fetchone()
     if not attachment:
@@ -3497,7 +4017,10 @@ def download_ticket_attachment(ticket_id: int, attachment_id: int) -> FileRespon
     target = (PRIVATE_ROOT / attachment["stored_name"]).resolve()
     if not target.is_relative_to(PRIVATE_ROOT) or not target.is_file():
         raise HTTPException(404, "附件文件不存在")
-    return FileResponse(target, media_type=attachment["content_type"], filename=attachment["original_name"])
+    stored = target.read_bytes()
+    content = decrypt_attachment(stored) if attachment["encrypted"] else stored
+    filename = quote(attachment["original_name"])
+    return Response(content=content, media_type=attachment["content_type"], headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
 
 
 @app.post("/api/feedback/{external_event_id}/actions")
@@ -3558,7 +4081,15 @@ def approve_service_action(action_id: int) -> dict[str, Any]:
         action = conn.execute("SELECT * FROM service_actions WHERE id=?", (action_id,)).fetchone()
         if not action:
             raise HTTPException(404, "售后动作不存在")
-        result = conn.execute("UPDATE service_actions SET status='approved',approved_by=?,approved_at=? WHERE id=? AND status='requested'", (request_actor.get(), now(), action_id))
+        require_independent_approver(request_actor.get(), action["requested_by"])
+        account = conn.execute("SELECT role FROM users WHERE username=? AND is_active=1", (request_actor.get(),)).fetchone()
+        if action["action_type"] == "refund":
+            remaining_cents, _ = refundable_balance_cents(conn, action["order_id"], action_id)
+            if action["amount_cents"] > remaining_cents:
+                raise HTTPException(409, "订单剩余可退金额已变化，请重新提交")
+            if account and account["role"] != "admin" and action["amount_cents"] > APPROVER_LIMIT_CENTS:
+                raise HTTPException(403, f"该退款超过审批人额度 USD {cents_to_money(APPROVER_LIMIT_CENTS):.2f}，需要管理员批准")
+        result = conn.execute("UPDATE service_actions SET status='approved',approved_by=?,approved_at=?,version=version+1 WHERE id=? AND status='requested'", (request_actor.get(), now(), action_id))
         if not result.rowcount:
             raise HTTPException(409, "售后动作状态已变化")
         conn.execute("INSERT INTO ticket_events(ticket_id,event_type,actor,body,metadata,created_at) VALUES(?,?,?,?,?,?)", (action["ticket_id"], "service_action_approved", request_actor.get(), action["reason"], json.dumps({"action_id": action_id}, ensure_ascii=False), now()))
@@ -3580,6 +4111,100 @@ def complete_service_action(action_id: int) -> dict[str, Any]:
         audit(conn, "service_action_completed", "ticket", action["ticket_id"], {"action_id": action_id, "mode": "internal_record_only"})
         conn.commit()
     return {"action_id": action_id, "status": "completed", "external_execution": False}
+
+
+@app.post("/api/inventory-adjustments")
+def request_inventory_adjustment(sku: str = Form(...), quantity_delta: int = Form(...), reason: str = Form(...)) -> dict[str, Any]:
+    sku, reason = sku.strip(), reason.strip()
+    if not sku or quantity_delta == 0 or len(reason) < 3:
+        raise HTTPException(422, "SKU、调整数量或原因无效")
+    with closing(connect()) as conn:
+        if not conn.execute("SELECT 1 FROM products WHERE sku=?", (sku,)).fetchone():
+            raise HTTPException(404, "商品不存在")
+        adjustment_id = conn.execute("INSERT INTO inventory_adjustments(sku,quantity_delta,reason,status,requested_by,requested_at) VALUES(?,?,?,'requested',?,?)", (sku, quantity_delta, reason, request_actor.get(), now())).lastrowid
+        audit(conn, "inventory_adjustment_requested", "inventory_adjustment", adjustment_id, {"sku": sku, "quantity_delta": quantity_delta, "reason": reason})
+        conn.commit()
+    return {"adjustment_id": adjustment_id, "status": "requested"}
+
+
+@app.post("/api/inventory-adjustments/{adjustment_id}/approve")
+def approve_inventory_adjustment(adjustment_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        adjustment = conn.execute("SELECT * FROM inventory_adjustments WHERE id=?", (adjustment_id,)).fetchone()
+        if not adjustment:
+            raise HTTPException(404, "库存调整不存在")
+        require_independent_approver(request_actor.get(), adjustment["requested_by"])
+        if not conn.execute("UPDATE inventory_adjustments SET status='approved',approved_by=?,approved_at=?,version=version+1 WHERE id=? AND status='requested'", (request_actor.get(), now(), adjustment_id)).rowcount:
+            raise HTTPException(409, "库存调整状态已变化")
+        audit(conn, "inventory_adjustment_approved", "inventory_adjustment", adjustment_id, {})
+        conn.commit()
+    return {"adjustment_id": adjustment_id, "status": "approved"}
+
+
+@app.post("/api/inventory-adjustments/{adjustment_id}/apply")
+def apply_inventory_adjustment(adjustment_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        adjustment = conn.execute("SELECT * FROM inventory_adjustments WHERE id=? AND status='approved'", (adjustment_id,)).fetchone()
+        if not adjustment:
+            raise HTTPException(409, "库存调整必须先批准")
+        warehouse = conn.execute("SELECT on_hand FROM warehouse_inventory WHERE sku=?", (adjustment["sku"],)).fetchone()
+        current = int(warehouse["on_hand"] if warehouse else 0)
+        if current + adjustment["quantity_delta"] < 0:
+            raise HTTPException(422, "调整后库存不能为负数")
+        conn.execute("INSERT INTO warehouse_inventory(sku,on_hand,qc_hold,updated_at) VALUES(?,?,0,?) ON CONFLICT(sku) DO UPDATE SET on_hand=warehouse_inventory.on_hand+excluded.on_hand,updated_at=excluded.updated_at", (adjustment["sku"], adjustment["quantity_delta"], now()))
+        conn.execute("INSERT INTO inventory_movements(sku,movement_type,quantity,reference_type,reference_id,note,actor,created_at) VALUES(?,'adjustment',?,'inventory_adjustment',?,?,?,?)", (adjustment["sku"], adjustment["quantity_delta"], adjustment_id, adjustment["reason"], request_actor.get(), now()))
+        conn.execute("UPDATE inventory_adjustments SET status='applied',applied_at=?,version=version+1 WHERE id=?", (now(), adjustment_id))
+        audit(conn, "inventory_adjustment_applied", "inventory_adjustment", adjustment_id, {"quantity_delta": adjustment["quantity_delta"]})
+        conn.commit()
+    return {"adjustment_id": adjustment_id, "status": "applied", "on_hand": current + adjustment["quantity_delta"]}
+
+
+@app.post("/api/service-actions/{action_id}/reversal")
+def request_service_action_reversal(action_id: int, reason: str = Form(...)) -> dict[str, Any]:
+    reason = reason.strip()
+    if len(reason) < 3:
+        raise HTTPException(422, "必须填写冲正原因")
+    with closing(connect()) as conn:
+        action = conn.execute("SELECT * FROM service_actions WHERE id=? AND status='completed'", (action_id,)).fetchone()
+        if not action:
+            raise HTTPException(409, "只能冲正已完成的售后动作")
+        try:
+            reversal_id = conn.execute("INSERT INTO service_action_reversals(service_action_id,reason,status,requested_by,requested_at) VALUES(?,?,'requested',?,?)", (action_id, reason, request_actor.get(), now())).lastrowid
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "该售后动作已有冲正记录") from exc
+        audit(conn, "service_action_reversal_requested", "service_action", action_id, {"reversal_id": reversal_id, "reason": reason})
+        conn.commit()
+    return {"reversal_id": reversal_id, "status": "requested"}
+
+
+@app.post("/api/service-action-reversals/{reversal_id}/approve")
+def approve_service_action_reversal(reversal_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        reversal = conn.execute("SELECT * FROM service_action_reversals WHERE id=?", (reversal_id,)).fetchone()
+        if not reversal:
+            raise HTTPException(404, "冲正记录不存在")
+        require_independent_approver(request_actor.get(), reversal["requested_by"])
+        if not conn.execute("UPDATE service_action_reversals SET status='approved',approved_by=?,approved_at=? WHERE id=? AND status='requested'", (request_actor.get(), now(), reversal_id)).rowcount:
+            raise HTTPException(409, "冲正状态已变化")
+        audit(conn, "service_action_reversal_approved", "service_action_reversal", reversal_id, {})
+        conn.commit()
+    return {"reversal_id": reversal_id, "status": "approved"}
+
+
+@app.post("/api/service-action-reversals/{reversal_id}/apply")
+def apply_service_action_reversal(reversal_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        reversal = conn.execute("SELECT * FROM service_action_reversals WHERE id=? AND status='approved'", (reversal_id,)).fetchone()
+        if not reversal:
+            raise HTTPException(409, "冲正必须先批准")
+        if not conn.execute("UPDATE service_actions SET status='cancelled',version=version+1 WHERE id=? AND status='completed'", (reversal["service_action_id"],)).rowcount:
+            raise HTTPException(409, "原售后动作状态已变化，无法冲正")
+        conn.execute("UPDATE service_action_reversals SET status='applied',applied_at=? WHERE id=?", (now(), reversal_id))
+        audit(conn, "service_action_reversal_applied", "service_action_reversal", reversal_id, {"service_action_id": reversal["service_action_id"], "external_execution": False})
+        conn.commit()
+    return {"reversal_id": reversal_id, "status": "applied", "external_execution": False}
 
 
 @app.post("/api/account/password")
@@ -3679,9 +4304,102 @@ def reset_user_mfa(username: str) -> dict[str, Any]:
     return {"username": username, "mfa_enabled": False, "sessions_revoked": True}
 
 
+@app.get("/api/admin/privacy/export")
+def export_customer_data(customer_alias: str) -> dict[str, Any]:
+    alias = customer_alias.strip()
+    if not alias or "*" not in alias:
+        raise HTTPException(422, "只能按已脱敏客户代称导出")
+    with closing(connect()) as conn:
+        subject_ref = privacy_subject_ref(alias)
+        orders = [dict(row) for row in conn.execute("SELECT order_id_masked,status,purchase_at,currency,item_total_cents,refund_total_cents FROM orders WHERE buyer_alias=? ORDER BY purchase_at", (alias,))]
+        tickets = [dict(row) for row in conn.execute("SELECT order_id_masked,event_type,status,title,event_at,resolved_at FROM tickets WHERE customer_alias=? ORDER BY event_at", (alias,))]
+        request_id = conn.execute("INSERT INTO privacy_requests(request_type,customer_alias,subject_ref,status,requested_by,requested_at,completed_by,completed_at,result_summary) VALUES(?, '[redacted]',?,'completed',?,?,?,?,?)", ("export", subject_ref, request_actor.get(), now(), request_actor.get(), now(), f"orders={len(orders)},tickets={len(tickets)}")).lastrowid
+        audit(conn, "privacy_export_completed", "privacy_request", request_id, {"subject_ref": subject_ref, "orders": len(orders), "tickets": len(tickets)})
+        conn.commit()
+    return {"request_id": request_id, "customer_alias": alias, "orders": orders, "tickets": tickets}
+
+
+@app.post("/api/admin/privacy/anonymize")
+def anonymize_customer_data(customer_alias: str = Form(...), reason: str = Form(...)) -> dict[str, Any]:
+    alias, reason = customer_alias.strip(), reason.strip()
+    if not alias or "*" not in alias or len(reason) < 3:
+        raise HTTPException(422, "客户代称或匿名化原因无效")
+    with closing(connect()) as conn:
+        subject_ref = privacy_subject_ref(alias)
+        if conn.execute("SELECT 1 FROM legal_holds WHERE entity_type='customer_alias' AND entity_key=? AND active=1", (alias,)).fetchone():
+            raise HTTPException(409, "该客户数据处于法务保留状态，不能匿名化")
+        ticket_ids = [row["id"] for row in conn.execute("SELECT id FROM tickets WHERE customer_alias=?", (alias,))]
+        attachment_count = purge_ticket_attachments(conn, ticket_ids, "privacy_request")
+        for ticket_id in ticket_ids:
+            conn.execute("UPDATE ticket_messages SET body='[已按隐私请求匿名化]',action_plan='[已按隐私请求匿名化]' WHERE ticket_id=?", (ticket_id,))
+            conn.execute("UPDATE ticket_events SET body='[已按隐私请求匿名化]',metadata='{}' WHERE ticket_id=?", (ticket_id,))
+        ticket_count = conn.execute("UPDATE tickets SET customer_alias='已匿名客户',message='[已按隐私请求匿名化]',conversation='[]',reply_draft=NULL,action_plan=NULL WHERE customer_alias=?", (alias,)).rowcount
+        order_count = conn.execute("UPDATE orders SET buyer_alias='已匿名客户' WHERE buyer_alias=?", (alias,)).rowcount
+        request_id = conn.execute("INSERT INTO privacy_requests(request_type,customer_alias,subject_ref,status,requested_by,requested_at,completed_by,completed_at,result_summary) VALUES(?, '[redacted]',?,'completed',?,?,?,?,?)", ("anonymize", subject_ref, request_actor.get(), now(), request_actor.get(), now(), reason)).lastrowid
+        audit(conn, "privacy_anonymization_completed", "privacy_request", request_id, {"subject_ref": subject_ref, "orders": order_count, "tickets": ticket_count, "attachments": attachment_count, "reason": reason})
+        conn.commit()
+    return {"request_id": request_id, "status": "completed", "orders": order_count, "tickets": ticket_count, "attachments": attachment_count}
+
+
+@app.post("/api/admin/legal-holds")
+def create_legal_hold(entity_type: str = Form(...), entity_key: str = Form(...), reason: str = Form(...)) -> dict[str, Any]:
+    entity_type, entity_key, reason = entity_type.strip(), entity_key.strip(), reason.strip()
+    if entity_type not in {"customer_alias", "order", "ticket"} or not entity_key or len(reason) < 3:
+        raise HTTPException(422, "法务保留参数无效")
+    with closing(connect()) as conn:
+        conn.execute("INSERT INTO legal_holds(entity_type,entity_key,reason,active,created_by,created_at) VALUES(?,?,?,1,?,?) ON CONFLICT(entity_type,entity_key) DO UPDATE SET reason=excluded.reason,active=1,created_by=excluded.created_by,created_at=excluded.created_at,released_by=NULL,released_at=NULL", (entity_type, entity_key, reason, request_actor.get(), now()))
+        hold_id = conn.execute("SELECT id FROM legal_holds WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()[0]
+        audit(conn, "legal_hold_created", "legal_hold", hold_id, {"entity_type": entity_type, "entity_key": entity_key, "reason": reason})
+        conn.commit()
+    return {"hold_id": hold_id, "status": "active"}
+
+
+@app.post("/api/sync-failures/{failure_id}/retry")
+def retry_sync_failure(failure_id: int) -> dict[str, Any]:
+    with closing(connect()) as conn:
+        failure = conn.execute("SELECT sf.status,sr.sync_type FROM sync_failures sf JOIN sync_runs sr ON sr.id=sf.sync_run_id WHERE sf.id=?", (failure_id,)).fetchone()
+        if not failure:
+            raise HTTPException(404, "同步失败记录不存在")
+        if failure["status"] == "resolved":
+            raise HTTPException(409, "该记录已处理")
+    job_id = enqueue_sync_job(failure["sync_type"])
+    with closing(connect()) as conn:
+        conn.execute("UPDATE sync_failures SET status='retrying',retry_job_id=?,resolution_note=? WHERE id=?", (job_id, "已发起全量渠道补偿同步", failure_id))
+        audit(conn, "sync_failure_retried", "sync_failure", failure_id, {"job_id": job_id, "sync_type": failure["sync_type"]})
+        conn.commit()
+    job = process_sync_job(job_id) if SYNC_INLINE else None
+    return {"failure_id": failure_id, "status": "retrying", "job_id": job_id, "job_status": job["job_status"] if job else "queued"}
+
+
+@app.post("/api/sync-failures/{failure_id}/resolve")
+def resolve_sync_failure(failure_id: int, reason: str = Form(...)) -> dict[str, Any]:
+    note = reason.strip()
+    if len(note) < 3:
+        raise HTTPException(422, "请填写处理说明")
+    with closing(connect()) as conn:
+        if not conn.execute("UPDATE sync_failures SET status='resolved',resolved_by=?,resolved_at=?,resolution_note=? WHERE id=? AND status<>'resolved'", (request_actor.get(), now(), note, failure_id)).rowcount:
+            raise HTTPException(409, "记录不存在或已处理")
+        audit(conn, "sync_failure_resolved", "sync_failure", failure_id, {"note": note})
+        conn.commit()
+    return {"failure_id": failure_id, "status": "resolved"}
+
+
+@app.post("/api/admin/legal-holds/{hold_id}/release")
+def release_legal_hold(hold_id: int, reason: str = Form(...)) -> dict[str, Any]:
+    if len(reason.strip()) < 3:
+        raise HTTPException(422, "请填写解除原因")
+    with closing(connect()) as conn:
+        result = conn.execute("UPDATE legal_holds SET active=0,released_by=?,released_at=? WHERE id=? AND active=1", (request_actor.get(), now(), hold_id))
+        if not result.rowcount:
+            raise HTTPException(409, "法务保留不存在或已解除")
+        audit(conn, "legal_hold_released", "legal_hold", hold_id, {"reason": reason.strip()})
+        conn.commit()
+    return {"hold_id": hold_id, "status": "released"}
+
+
 @app.get("/{page}", response_class=HTMLResponse, include_in_schema=False)
 def show_page(request: Request, page: str) -> HTMLResponse:
-    if page not in {"dashboard", "orders", "products", "profit", "listings", "inventory", "procurement", "tickets", "feedback", "audit", "settings"}:
+    if page not in {"guide", "dashboard", "orders", "products", "profit", "listings", "inventory", "procurement", "tickets", "feedback", "sync-failures", "audit", "settings"}:
         raise HTTPException(404)
     context = page_context(page, dict(request.query_params), request.state.user)
     context["current_user"] = request.state.user

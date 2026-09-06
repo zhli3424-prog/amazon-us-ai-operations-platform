@@ -3,6 +3,8 @@ import io
 import json
 import csv
 import base64
+import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -50,6 +52,17 @@ def verify_evidence(api, main, product_id, fields=("source_title",)):
     assert found == set(fields)
 
 
+def login_as(api, main, username, role):
+    with main.connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO users(username,password_hash,role,is_active,created_at,must_change_password,password_changed_at) VALUES(?,?,?,?,?,0,?)", (username, main.hash_password("StrongPassword123"), role, 1, main.now(), main.now()))
+        token, csrf = main.create_session(username, role, main.SESSION_SECRET)
+        session = main.read_session(token, main.SESSION_SECRET)
+        conn.execute("INSERT INTO user_sessions(session_id,username,created_at,expires_at,last_seen_at,user_agent,ip_masked) VALUES(?,?,?,?,?,?,?)", (session["sid"], username, main.now(), main.datetime.fromtimestamp(session["exp"], main.timezone.utc).isoformat(timespec="seconds"), main.now(), "pytest", "127.0.0.*"))
+        conn.commit()
+    api.cookies.set("ops_session", token)
+    api.headers["X-CSRF-Token"] = csrf
+
+
 def test_complete_listing_workflow(client):
     api, main = client
     result = upload(api, "/api/import/products", PRODUCT_CSV)
@@ -75,8 +88,8 @@ def test_complete_listing_workflow(client):
     blocked = api.post(f"/api/listings/{listing['listing_id']}/publish", data={"version": 1})
     assert blocked.status_code == 409
 
-    approved = api.post(
-        f"/api/listings/{listing['listing_id']}/approve",
+    saved = api.post(
+        f"/api/listings/{listing['listing_id']}/save",
         data={
             "title": "Edited US Title",
             "bullet_points": "One\nTwo\nThree\nFour\nFive",
@@ -89,8 +102,11 @@ def test_complete_listing_workflow(client):
             "version": 1,
         },
     )
+    assert saved.json()["status"] == "draft"
+    login_as(api, main, "listing-approver", "approver")
+    approved = api.post(f"/api/listings/{listing['listing_id']}/approve", data={"version": 2})
     assert approved.json()["status"] == "approved"
-    published = api.post(f"/api/listings/{listing['listing_id']}/publish", data={"version": 2})
+    published = api.post(f"/api/listings/{listing['listing_id']}/publish", data={"version": 3})
     assert published.json()["status"] == "mock_published"
 
     with main.connect() as conn:
@@ -157,7 +173,7 @@ def test_ai_validation_and_safe_failure(client, monkeypatch):
 def test_pages_and_health(client):
     api, _ = client
     assert api.get("/").status_code == 200
-    for path in ("dashboard", "orders", "products", "profit", "listings", "inventory", "procurement", "tickets", "feedback", "audit", "settings"):
+    for path in ("guide", "dashboard", "orders", "products", "profit", "listings", "inventory", "procurement", "tickets", "feedback", "sync-failures", "audit", "settings"):
         response = api.get(f"/{path}")
         assert response.status_code == 200
         assert "跨境智营台" in response.text
@@ -202,11 +218,11 @@ def test_realistic_sample_dataset_imports_and_links(client):
     assert {path.stem for path in image_dir.glob("*.png")} == product_skus
     product_pages = api.get("/products").text + api.get("/products?page_no=2").text
     assert all(f"/static/products/{sku}.png" in product_pages for sku in product_skus)
-    inventory_page = api.get("/inventory").text
+    inventory_page = api.get("/inventory").text + api.get("/inventory?page_no=2").text
     order_page = api.get("/orders").text
     ticket_page = api.get("/tickets").text
     feedback_page = api.get("/feedback").text
-    profit_page = api.get("/profit").text
+    profit_page = api.get("/profit").text + api.get("/profit?page_no=2").text
     assert 'type="file"' not in inventory_page
     assert "/api/tickets/import" not in ticket_page
     assert "上传私有附件" in ticket_page
@@ -261,9 +277,17 @@ def test_ticket_history_escalation_reopen_and_service_action_gate(client):
     assert requested.status_code == 200
     action_id = requested.json()["action_id"]
     assert api.post(f"/api/service-actions/{action_id}/complete").status_code == 409
+    login_as(api, main, "service-approver", "approver")
     assert api.post(f"/api/service-actions/{action_id}/approve").json()["status"] == "approved"
     completed = api.post(f"/api/service-actions/{action_id}/complete").json()
     assert completed == {"action_id": action_id, "status": "completed", "external_execution": False}
+    reversal = api.post(f"/api/service-actions/{action_id}/reversal", data={"reason": "内部登记类型选择错误"})
+    assert reversal.status_code == 200
+    login_as(api, main, "service-reversal-admin", "admin")
+    reversal_id = reversal.json()["reversal_id"]
+    assert api.post(f"/api/service-action-reversals/{reversal_id}/approve").status_code == 200
+    reversed_action = api.post(f"/api/service-action-reversals/{reversal_id}/apply")
+    assert reversed_action.status_code == 200 and reversed_action.json()["external_execution"] is False
     assert api.post(f"/api/tickets/{ticket_id}/update", data={"assigned_to": "售后主管·林悦", "status": "processing", "resolution": "", "version": 3}).status_code == 200
     assert api.post(f"/api/tickets/{ticket_id}/update", data={"assigned_to": "售后主管·林悦", "status": "resolved", "resolution": "退款审批与仓库检测均已登记", "version": 4}).status_code == 200
     reopened = api.post(f"/api/tickets/{ticket_id}/reopen", data={"version": 5, "reason": "买家补充了新的问题说明"})
@@ -287,11 +311,13 @@ def test_replenishment_purchase_order_approval_and_receipt(client):
     assert created.status_code == 200 and created.json()["status"] == "draft"
     plan_id = created.json()["plan_id"]
     assert api.post(f"/api/products/{product_id}/replenishment-plans", data={"quantity": 180, "reason": "重复计划"}).status_code == 409
+    login_as(api, main, "procurement-approver", "approver")
     approved = api.post(f"/api/replenishment-plans/{plan_id}/approve", data={"version": 1, "approved_qty": 160})
     assert approved.status_code == 200
     converted = api.post(f"/api/replenishment-plans/{plan_id}/convert").json()
     po_id = converted["purchase_order_id"]
     assert converted["status"] == "draft"
+    login_as(api, main, "procurement-admin", "admin")
     assert api.post(f"/api/purchase-orders/{po_id}/approve", data={"version": 1}).json()["status"] == "approved"
     assert api.post(f"/api/purchase-orders/{po_id}/send-demo", data={"version": 2}).json()["external_execution"] is False
     with main.connect() as conn:
@@ -350,7 +376,8 @@ def test_finance_records_cost_config_inventory_history_and_market_score(client):
     assert finance["inserted"] > 30 and finance["errors"] == 0
     assert api.post("/api/channels/amazon-us/sync/finance").json()["skipped"] == finance["inserted"]
     context = main.page_context("profit")
-    settled = [p for p in context["products"] if p["economics"]["data_source"] == "结算流水"]
+    second_page = main.page_context("profit", {"page_no": "2"})
+    settled = [p for p in context["products"] + second_page["products"] if p["economics"]["data_source"] == "结算流水"]
     assert len(settled) == 8 and context["business_totals"]["sku_coverage"] == 8
     assert context["business_totals"]["data_source"] == "结算流水"
     assert sum(main.allocate_cents(1001, [1000, 2000, 3000])) == 1001
@@ -401,13 +428,13 @@ def test_listing_evidence_compliance_trademark_and_ai_usage(client):
 
     second = api.post("/api/products/2/listing/generate").json()
     verify_evidence(api, main, 2)
-    forbidden = api.post(f"/api/listings/{second['listing_id']}/approve", data={
+    forbidden = api.post(f"/api/listings/{second['listing_id']}/save", data={
         "version": 1, "title": "Kindle Compatible Demo Vacuum", "bullet_points": "One\nTwo\nThree\nFour\nFive",
         "description": "A careful generic description.", "search_terms": "vacuum, home",
         "title_zh": "演示吸尘器", "bullet_points_zh": "第一点\n第二点\n第三点\n第四点\n第五点",
         "description_zh": "中文审核描述。", "search_terms_zh": "吸尘器，家居",
     })
-    assert forbidden.status_code == 422 and "kindle" in forbidden.text.lower()
+    assert forbidden.status_code == 200 and forbidden.json()["compliance_status"] == "blocked" and "kindle" in forbidden.text.lower()
     listing_page = api.get("/listings").text
     assert "AI 调用与合规追踪" in listing_page and main.LISTING_PROMPT_VERSION in listing_page
 
@@ -550,9 +577,12 @@ def test_optimistic_locking_and_ticket_state_machine(client):
     upload(api, "/api/import/products", PRODUCT_CSV)
     verify_evidence(api, main, 1)
     listing = api.post("/api/products/1/listing/generate").json()
-    payload = {"title": "Safe title", "bullet_points": "One\nTwo\nThree\nFour\nFive", "description": "Reviewed.", "search_terms": "safe, title", "version": 1}
-    assert api.post(f"/api/listings/{listing['listing_id']}/approve", data=payload).status_code == 200
-    assert api.post(f"/api/listings/{listing['listing_id']}/approve", data=payload).status_code == 409
+    generated = main.demo_listing({"source_title": "Demo Kitchen Scale", "category": "kitchen scale"})
+    payload = {"title": "Safe title", "bullet_points": "One\nTwo\nThree\nFour\nFive", "description": "Reviewed.", "search_terms": "safe, title", "title_zh": generated["title_zh"], "bullet_points_zh": "\n".join(generated["bullet_points_zh"]), "description_zh": generated["description_zh"], "search_terms_zh": "，".join(generated["search_terms_zh"]), "version": 1}
+    assert api.post(f"/api/listings/{listing['listing_id']}/save", data=payload).status_code == 200
+    login_as(api, main, "lock-approver", "approver")
+    assert api.post(f"/api/listings/{listing['listing_id']}/approve", data={"version": 2}).status_code == 200
+    assert api.post(f"/api/listings/{listing['listing_id']}/approve", data={"version": 2}).status_code == 409
 
     main.sync_ticket_rows([{"external_event_id": "state-1", "sku": "SKU-1", "event_type": "buyer_message", "source": "Messaging", "order_id_masked": "114-***-0002", "customer_alias": "客户 A***1", "event_at": "2026-09-03T01:00:00Z", "rating": 3, "refund_requested": False, "title": "Question", "message": "Please help"}])
     with main.connect() as conn:
@@ -650,6 +680,9 @@ def test_feedback_actions_and_private_ticket_attachments(client):
     downloaded = api.get(f"/api/tickets/{ticket_id}/attachments/{attachment_id}")
     assert downloaded.status_code == 200 and downloaded.content == png
     stored_file = next(main.PRIVATE_ROOT.iterdir())
+    assert stored_file.read_bytes() != png and stored_file.read_bytes().startswith(b"gAAAA")
+    with main.connect() as conn:
+        assert conn.execute("SELECT encrypted FROM ticket_attachments WHERE id=?", (attachment_id,)).fetchone()[0] == 1
     assert not (main.MEDIA_ROOT / stored_file.name).exists()
     bad = api.post(
         f"/api/tickets/{ticket_id}/attachments",
@@ -689,7 +722,7 @@ def test_audit_health_metrics_and_backup_restore(client, tmp_path):
     api, main = client
     upload(api, "/api/import/products", PRODUCT_CSV)
     health = api.get("/health").json()
-    assert health["audit_chain"] == "ok" and health["database_integrity"] == "ok" and health["schema_version"] == 18
+    assert health["audit_chain"] == "ok" and health["database_integrity"] == "ok" and health["schema_version"] == 21
     metrics = api.get("/health/metrics")
     assert metrics.status_code == 200 and "tickets_overdue" in metrics.json()
     from scripts.backup_db import backup
@@ -698,7 +731,7 @@ def test_audit_health_metrics_and_backup_restore(client, tmp_path):
     backup_file = backup(main.db_path(), tmp_path / "backups", retention=2)
     assert backup_file.with_suffix(".json").is_file()
     restored = restore(backup_file, tmp_path / "restored" / "app.db")
-    assert check(restored) == 18
+    assert check(restored) == 21
 
 
 def test_sql_pagination_notifications_and_real_concurrent_review(client):
@@ -730,3 +763,349 @@ def test_sql_pagination_notifications_and_real_concurrent_review(client):
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = sorted(pool.map(approve_once, range(2)))
     assert statuses == [200, 409]
+
+
+def test_money_approval_cost_snapshot_and_draft_po_pipeline(client):
+    api, main = client
+    samples = Path(__file__).resolve().parent.parent / "samples"
+    upload(api, "/api/import/products", (samples / "products.csv").read_bytes())
+    api.post("/api/channels/amazon-us/sync/orders")
+    api.post("/api/channels/amazon-us/sync/tickets")
+    with main.connect() as conn:
+        ticket = conn.execute("SELECT id,order_ref_id FROM tickets WHERE order_ref_id IS NOT NULL LIMIT 1").fetchone()
+        order = conn.execute("SELECT * FROM orders WHERE id=?", (ticket["order_ref_id"],)).fetchone()
+        remaining = order["item_total_cents"] + order["shipping_total_cents"] + order["tax_total_cents"] - order["promotion_total_cents"] - order["refund_total_cents"]
+    too_much = api.post(f"/api/tickets/{ticket['id']}/service-actions", data={"action_type": "refund", "amount": remaining / 100 + 0.01, "reason": "验证超额退款门禁"})
+    assert too_much.status_code == 409
+    requested = api.post(f"/api/tickets/{ticket['id']}/service-actions", data={"action_type": "refund", "amount": min(10, remaining / 100), "reason": "验证退款审批隔离"})
+    action_id = requested.json()["action_id"]
+    assert api.post(f"/api/service-actions/{action_id}/approve").status_code == 409
+    login_as(api, main, "refund-approver", "approver")
+    assert api.post(f"/api/service-actions/{action_id}/approve").status_code == 200
+
+    with main.connect() as conn:
+        item = conn.execute("SELECT product_id,unit_cost_cents FROM order_items LIMIT 1").fetchone()
+        frozen_cost = item["unit_cost_cents"]
+        conn.execute("UPDATE products SET cost=999,cost_cents=99900 WHERE id=?", (item["product_id"],))
+        assert conn.execute("SELECT unit_cost_cents FROM order_items WHERE product_id=? LIMIT 1", (item["product_id"],)).fetchone()[0] == frozen_cost
+        product = dict(conn.execute("SELECT * FROM products WHERE id=?", (item["product_id"],)).fetchone())
+        product["actual_order_units"] = 1
+        product["actual_cogs_cents"] = frozen_cost
+        economics = main.product_economics(product, {"other_cost_per_unit": 0}, [{"transaction_type": "principal", "amount_cents": 5000}])
+        assert economics["product_cost"] == main.Decimal(frozen_cost) / 100
+
+    login_as(api, main, "inventory-operator", "operator")
+    with main.connect() as conn:
+        product_id = conn.execute("SELECT id FROM products LIMIT 1").fetchone()[0]
+    plan = api.post(f"/api/products/{product_id}/replenishment-plans", data={"quantity": 100, "reason": "验证草稿不计入在途"}).json()
+    login_as(api, main, "inventory-approver", "approver")
+    api.post(f"/api/replenishment-plans/{plan['plan_id']}/approve", data={"version": 1, "approved_qty": 100})
+    po = api.post(f"/api/replenishment-plans/{plan['plan_id']}/convert").json()
+    with main.connect() as conn:
+        sku = conn.execute("SELECT sku FROM replenishment_plans WHERE id=?", (plan["plan_id"],)).fetchone()[0]
+        draft_pipeline = conn.execute("SELECT COALESCE(SUM(poi.ordered_qty-poi.received_qty-poi.rejected_qty),0) FROM purchase_order_items poi JOIN purchase_orders po ON po.id=poi.purchase_order_id WHERE poi.sku=? AND po.status IN ('approved','sent_demo','partially_received')", (sku,)).fetchone()[0]
+    assert po["status"] == "draft" and draft_pipeline == 0
+
+
+def test_formal_migration_retention_hold_adapter_and_checkpoint(client, tmp_path, monkeypatch):
+    api, main = client
+    legacy = tmp_path / "legacy.db"
+    with sqlite3.connect(legacy) as conn:
+        conn.executescript(main.SCHEMA)
+        conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(18,'2026-01-01T00:00:00Z')")
+        main.apply_migrations(conn, Path(main.ROOT) / "migrations")
+        assert [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == [18, 19, 20, 21]
+
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    main.sync_order_rows([{"external_order_id": "old-order", "order_id_masked": "111-***-9999", "status": "delivered", "fulfillment_channel": "AFN", "purchase_at": "2020-01-01T00:00:00Z", "currency": "USD", "item_total": 20, "shipping_total": 0, "tax_total": 0, "promotion_total": 0, "refund_total": 0, "buyer_alias": "客户 Z***9", "items": [{"external_item_id": "old-item", "sku": "SKU-1", "asin": "B0TEST000001", "quantity": 1, "item_price": 20, "item_tax": 0, "promotion_discount": 0, "item_status": "delivered"}]}])
+    hold = api.post("/api/admin/legal-holds", data={"entity_type": "customer_alias", "entity_key": "客户 Z***9", "reason": "争议调查保留"}).json()
+    with main.connect() as conn:
+        main.apply_data_retention(conn)
+        assert conn.execute("SELECT buyer_alias FROM orders WHERE external_order_id='old-order'").fetchone()[0] == "客户 Z***9"
+    api.post(f"/api/admin/legal-holds/{hold['hold_id']}/release", data={"reason": "争议调查结束"})
+    with main.connect() as conn:
+        main.apply_data_retention(conn)
+        assert conn.execute("SELECT buyer_alias FROM orders WHERE external_order_id='old-order'").fetchone()[0] == "已匿名客户"
+        checkpoint = main.create_audit_checkpoint(conn)
+        conn.commit()
+        assert checkpoint and main.verify_latest_audit_checkpoint(conn)
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"rows": [{"external_order_id": "gateway-order"}]}
+    monkeypatch.setattr("app.channels.httpx.get", lambda *args, **kwargs: Response())
+    adapter = main.HttpAmazonAdapter("https://gateway.example", "secret")
+    assert adapter.fetch("orders")[0]["external_order_id"] == "gateway-order"
+
+
+def test_session_key_rotation_private_media_and_global_login_throttle(client, monkeypatch):
+    api, main = client
+    original_cookie = api.cookies.get("ops_session")
+    original_csrf = api.headers["X-CSRF-Token"]
+    old_token, _ = main.create_session("admin", "admin", "previous-session-secret-at-least-32-characters", session_id="old-session")
+    with main.connect() as conn:
+        conn.execute("INSERT INTO user_sessions(session_id,username,created_at,expires_at,last_seen_at,user_agent,ip_masked) VALUES(?,?,?,?,?,?,?)", ("old-session", "admin", main.now(), "2099-01-01T00:00:00+00:00", main.now(), "test", "127.0.0.*"))
+        conn.commit()
+    monkeypatch.setattr(main, "SESSION_SECRET_PREVIOUS", "previous-session-secret-at-least-32-characters")
+    api.cookies.clear()
+    api.cookies.set("ops_session", old_token)
+    assert api.get("/dashboard").status_code == 200
+    api.cookies.clear()
+    api.cookies.set("ops_session", original_cookie)
+    api.headers["X-CSRF-Token"] = original_csrf
+
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    uploaded = api.post("/api/products/1/image", data={"version": 1}, files={"file": ("pixel.png", b"\x89PNG\r\n\x1a\n" + b"demo", "image/png")})
+    media_url = uploaded.json()["image_url"]
+    current_cookie = api.cookies.get("ops_session")
+    api.cookies.clear()
+    assert api.get(media_url, follow_redirects=False).status_code == 303
+    api.cookies.set("ops_session", current_cookie)
+
+    for index in range(20):
+        response = api.post("/login", data={"username": f"unknown-{index}", "password": "wrong"}, follow_redirects=False)
+    assert "error=locked" in response.headers["location"]
+
+
+def test_mfa_encryption_key_rotation_and_display_timezone(client, monkeypatch):
+    _, main = client
+    old_key = "old-mfa-encryption-key-at-least-32-characters"
+    encrypted = main.mfa_cipher(old_key).encrypt(b"JBSWY3DPEHPK3PXP").decode("ascii")
+    monkeypatch.setattr(main, "MFA_ENCRYPTION_KEY_PREVIOUS", old_key)
+    assert main.decrypt_mfa_secret(encrypted) == "JBSWY3DPEHPK3PXP"
+    assert main.display_time("2026-09-06T00:00:00+00:00").endswith(main.DISPLAY_TIMEZONE_NAME)
+
+
+def test_inventory_feedback_and_profit_are_paginated(client):
+    api, main = client
+    upload(api, "/api/import/products", (Path(__file__).resolve().parent.parent / "samples" / "products.csv").read_bytes())
+    api.post("/api/channels/amazon-us/sync/feedback")
+    assert len(main.page_context("inventory")["products"]) == 10
+    assert main.page_context("inventory")["pagination"]["pages"] == 2
+    assert len(main.page_context("profit")["products"]) == 10
+    feedback = main.page_context("feedback")
+    assert len(feedback["feedback"]) == 10 and feedback["pagination"]["total"] == 10
+
+
+@pytest.mark.performance
+def test_product_page_stays_bounded_with_two_thousand_rows(client):
+    api, _ = client
+    header = PRODUCT_CSV.decode().splitlines()[0]
+    rows = [header]
+    for index in range(2000):
+        rows.append(f"LOAD-{index:04d},B0{index:010d},Load Product {index},home,19.99,7.25,200,4.2,30,50,20,2,14")
+    assert upload(api, "/api/import/products", "\n".join(rows).encode()).json()["imported"] == 2000
+    started = time.perf_counter()
+    response = api.get("/products?page_no=100")
+    assert response.status_code == 200 and response.text.count('class="product-thumb"') <= 10
+    assert time.perf_counter() - started < 5
+
+
+def test_webhook_dispatch_is_signed_retriable_and_outside_write_transaction(client, monkeypatch):
+    _, main = client
+    with main.connect() as conn:
+        notification_id = conn.execute(
+            "INSERT INTO operational_notifications(fingerprint,category,severity,title,href,status,first_seen_at,last_seen_at) VALUES('webhook-test','sla','critical','SLA alert','/tickets','unread',?,?)",
+            (main.now(), main.now()),
+        ).lastrowid
+        delivery_id = conn.execute(
+            "INSERT INTO notification_deliveries(notification_id,channel,status,created_at) VALUES(?,'webhook','pending',?)",
+            (notification_id, main.now()),
+        ).lastrowid
+        conn.commit()
+    captured = {}
+
+    class Response:
+        status_code = 202
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, content, headers, timeout):
+        captured.update(url=url, content=content, headers=headers, timeout=timeout)
+        with main.connect() as conn:
+            conn.execute("UPDATE operational_notifications SET title='SLA alert delivered' WHERE id=?", (notification_id,))
+            conn.commit()
+        return Response()
+
+    monkeypatch.setattr(main, "ALERT_WEBHOOK_URL", "https://alerts.example/hooks")
+    monkeypatch.setattr(main, "ALERT_WEBHOOK_SIGNING_KEY", "webhook-signing-test-key")
+    monkeypatch.setattr(main.httpx, "post", fake_post)
+    assert main.dispatch_notification_deliveries() == {"sent": 1, "failed": 0}
+    assert captured["headers"]["Idempotency-Key"] == f"alert-{delivery_id}"
+    assert captured["headers"]["X-Webhook-Signature"]
+    with main.connect() as conn:
+        delivery = conn.execute("SELECT status,response_code,next_attempt_at FROM notification_deliveries WHERE id=?", (delivery_id,)).fetchone()
+    assert tuple(delivery) == ("sent", 202, None)
+
+
+def test_privacy_anonymization_deletes_attachment_and_never_persists_subject_alias(client):
+    api, main = client
+    samples = Path(__file__).resolve().parent.parent / "samples"
+    upload(api, "/api/import/products", (samples / "products.csv").read_bytes())
+    api.post("/api/channels/amazon-us/sync/orders")
+    api.post("/api/channels/amazon-us/sync/tickets")
+    with main.connect() as conn:
+        ticket = conn.execute("SELECT id,customer_alias FROM tickets WHERE is_archived=0 AND customer_alias LIKE '%*%' LIMIT 1").fetchone()
+    uploaded = api.post(
+        f"/api/tickets/{ticket['id']}/attachments",
+        files={"file": ("evidence.txt", io.BytesIO(b"private evidence"), "text/plain")},
+    ).json()
+    with main.connect() as conn:
+        stored_name = conn.execute("SELECT stored_name FROM ticket_attachments WHERE id=?", (uploaded["attachment_id"],)).fetchone()[0]
+    stored_path = main.PRIVATE_ROOT / stored_name
+    assert stored_path.is_file()
+    result = api.post("/api/admin/privacy/anonymize", data={"customer_alias": ticket["customer_alias"], "reason": "客户删除请求已核验"})
+    assert result.status_code == 200 and result.json()["attachments"] == 1
+    assert not stored_path.exists()
+    with main.connect() as conn:
+        privacy = conn.execute("SELECT customer_alias,subject_ref FROM privacy_requests WHERE id=?", (result.json()["request_id"],)).fetchone()
+        attachment = conn.execute("SELECT original_name,deleted_at FROM ticket_attachments WHERE id=?", (uploaded["attachment_id"],)).fetchone()
+    assert privacy["customer_alias"] == "[redacted]" and len(privacy["subject_ref"]) == 64
+    assert ticket["customer_alias"] not in privacy["subject_ref"] and tuple(attachment)[0] == "[已删除]" and attachment["deleted_at"]
+
+
+def test_inventory_adjustment_uses_maker_checker_and_permission_boundary(client):
+    api, main = client
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    requested = api.post("/api/inventory-adjustments", data={"sku": "SKU-1", "quantity_delta": 7, "reason": "INV-2026-001 盘点盈余"})
+    assert requested.status_code == 200
+    adjustment_id = requested.json()["adjustment_id"]
+    assert api.post(f"/api/inventory-adjustments/{adjustment_id}/approve").status_code == 409
+    login_as(api, main, "inventory-operator", "operator")
+    assert api.post(f"/api/inventory-adjustments/{adjustment_id}/approve").status_code == 403
+    login_as(api, main, "inventory-approver", "approver")
+    assert api.post(f"/api/inventory-adjustments/{adjustment_id}/approve").status_code == 200
+    applied = api.post(f"/api/inventory-adjustments/{adjustment_id}/apply")
+    assert applied.status_code == 200 and applied.json()["on_hand"] == 7
+    assert "INV-2026-001" in api.get("/inventory").text
+
+
+def test_money_guards_request_size_and_external_audit_checkpoint(client, monkeypatch, tmp_path):
+    api, main = client
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    with main.connect() as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="money columns disagree"):
+            conn.execute("UPDATE products SET price=99 WHERE sku='SKU-1'")
+    monkeypatch.setattr(main, "MAX_REQUEST_BYTES", 16)
+    oversized = api.post("/api/import/products", content=b"x" * 17, headers={"content-type": "text/csv"})
+    assert oversized.status_code == 413
+    checkpoint_file = tmp_path / "external-audit" / "checkpoints.jsonl"
+    monkeypatch.setattr(main, "AUDIT_CHECKPOINT_PATH", checkpoint_file)
+    monkeypatch.setattr(main, "AUDIT_SIGNING_KEY", "audit-signing-test-key")
+    with main.connect() as conn:
+        checkpoint = main.create_audit_checkpoint(conn)
+        conn.commit()
+    record = json.loads(checkpoint_file.read_text(encoding="utf-8").strip())
+    assert record["last_event_id"] == checkpoint["last_event_id"] and len(record["signature"]) == 64
+
+
+def test_channel_pages_commit_cursor_and_aggregate_results(client, monkeypatch):
+    api, main = client
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    seen_cursors = []
+
+    class PagedAdapter:
+        mode = "amazon_sp_api_gateway"
+        def iter_pages(self, sync_type, cursor=None):
+            seen_cursors.append(cursor)
+            base = {"sku": "SKU-1", "reserved": 0, "inbound": 0, "unfulfillable": 0, "daily_sales": 2, "lead_time_days": 10}
+            yield [{**base, "external_event_id": "page-1", "fulfillable": 12}], "cursor-2", "watermark-1"
+            yield [{**base, "external_event_id": "page-2", "fulfillable": 14}], None, "watermark-2"
+
+    monkeypatch.setattr(main, "channel_adapter", lambda: PagedAdapter())
+    result = api.post("/api/channels/amazon-us/sync/inventory").json()
+    assert result["fetched"] == 2 and result["inserted"] == 2 and len(result["sync_run_ids"]) == 2
+    assert seen_cursors == [None]
+    with main.connect() as conn:
+        cursor = conn.execute("SELECT cursor,watermark FROM channel_sync_cursors WHERE sync_type='inventory'").fetchone()
+    assert tuple(cursor) == ("watermark-2", "watermark-2")
+
+
+def test_purchase_order_can_be_cancelled_before_receipt_with_maker_checker(client):
+    api, main = client
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    plan = api.post("/api/products/1/replenishment-plans", data={"quantity": 20, "reason": "补充安全库存"}).json()
+    login_as(api, main, "po-cancel-approver", "approver")
+    assert api.post(f"/api/replenishment-plans/{plan['plan_id']}/approve", data={"version": 1, "approved_qty": 20}).status_code == 200
+    po = api.post(f"/api/replenishment-plans/{plan['plan_id']}/convert").json()
+    cancellation = api.post(f"/api/purchase-orders/{po['purchase_order_id']}/cancellation", data={"reason": "供应商交期无法满足"})
+    assert cancellation.status_code == 200
+    assert api.post(f"/api/purchase-order-cancellations/{cancellation.json()['cancellation_id']}/approve").status_code == 409
+    login_as(api, main, "po-cancel-admin", "admin")
+    cancellation_id = cancellation.json()["cancellation_id"]
+    assert api.post(f"/api/purchase-order-cancellations/{cancellation_id}/approve").status_code == 200
+    assert api.post(f"/api/purchase-order-cancellations/{cancellation_id}/apply").json()["status"] == "applied"
+    with main.connect() as conn:
+        assert conn.execute("SELECT status FROM purchase_orders WHERE id=?", (po["purchase_order_id"],)).fetchone()[0] == "cancelled"
+
+
+def test_automatic_backup_is_recorded_replicated_and_not_repeated_while_fresh(client, monkeypatch, tmp_path):
+    _, main = client
+    backup_root = tmp_path / "primary-backups"
+    replica_root = tmp_path / "replicated-backups"
+    monkeypatch.setattr(main, "BACKUP_ROOT", backup_root)
+    monkeypatch.setattr(main, "BACKUP_REPLICA_PATH", replica_root)
+    first = main.ensure_recent_backup()
+    second = main.ensure_recent_backup()
+    assert first["status"] == "created" and second["status"] == "fresh"
+    with main.connect() as conn:
+        run = conn.execute("SELECT status,backup_path,replica_path,sha256,schema_version FROM backup_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert run["status"] == "success" and Path(run["backup_path"]).is_file() and Path(run["replica_path"]).is_file()
+    assert len(run["sha256"]) == 64 and run["schema_version"] == 21
+
+
+def test_backup_failure_is_recorded_and_partial_primary_is_removed(client, monkeypatch, tmp_path):
+    _, main = client
+    from scripts import backup_db
+    original_copy = backup_db.shutil.copy2
+    def fail_replica(source, target):
+        if Path(target).parent.name == "replica":
+            raise OSError("replica unavailable")
+        return original_copy(source, target)
+    monkeypatch.setattr(backup_db.shutil, "copy2", fail_replica)
+    target_dir, replica_dir = tmp_path / "primary", tmp_path / "replica"
+    with pytest.raises(OSError, match="replica unavailable"):
+        backup_db.backup(main.db_path(), target_dir, replica_dir=replica_dir)
+    assert not list(target_dir.glob("*.db"))
+    with main.connect() as conn:
+        failed = conn.execute("SELECT status,error FROM backup_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert failed["status"] == "failed" and "replica unavailable" in failed["error"]
+
+
+def test_sync_failure_workbench_retry_and_resolve(client):
+    api, main = client
+    upload(api, "/api/import/products", PRODUCT_CSV)
+    result = main.sync_inventory_rows([{"external_event_id": "bad-row", "sku": "SKU-1", "fulfillable": -1, "reserved": 0, "inbound": 0, "unfulfillable": 0, "daily_sales": 1, "lead_time_days": 2}])
+    with main.connect() as conn:
+        failure_id = conn.execute("SELECT id FROM sync_failures WHERE sync_run_id=?", (result["sync_run_id"],)).fetchone()[0]
+    page = api.get("/sync-failures")
+    assert page.status_code == 200 and "bad-row" in page.text and "重试同步" in page.text
+    retried = api.post(f"/api/sync-failures/{failure_id}/retry")
+    assert retried.status_code == 200 and retried.json()["status"] == "retrying"
+    resolved = api.post(f"/api/sync-failures/{failure_id}/resolve", data={"reason": "渠道源数据已修正"})
+    assert resolved.status_code == 200 and resolved.json()["status"] == "resolved"
+    assert "渠道源数据已修正" in api.get("/sync-failures?failure_status=resolved").text
+
+
+def test_webhook_active_lease_prevents_duplicate_delivery(client, monkeypatch):
+    _, main = client
+    with main.connect() as conn:
+        notification_id = conn.execute("INSERT INTO operational_notifications(fingerprint,category,severity,title,href,status,first_seen_at,last_seen_at) VALUES('leased','ops','warning','leased alert','/dashboard','unread',?,?)", (main.now(), main.now())).lastrowid
+        conn.execute("INSERT INTO notification_deliveries(notification_id,channel,status,created_at,claim_token,claimed_at) VALUES(?,'webhook','pending',?,'other-worker',?)", (notification_id, main.now(), main.now()))
+        conn.commit()
+    calls = []
+    monkeypatch.setattr(main, "ALERT_WEBHOOK_URL", "https://alerts.example/hooks")
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: calls.append(1))
+    assert main.dispatch_notification_deliveries() == {"sent": 0, "failed": 0}
+    assert calls == []
+
+
+def test_worker_cycle_runs_maintenance_and_one_job(monkeypatch):
+    from app import worker
+    calls = []
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 35.0)
+    monkeypatch.setattr(worker, "run_operational_maintenance", lambda: calls.append("maintenance"))
+    monkeypatch.setattr(worker, "run_next_job", lambda: {"job_id": 1})
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: calls.append(("sleep", seconds)))
+    assert worker.run_cycle(0.0) == 35.0
+    assert calls == ["maintenance"]
